@@ -167,8 +167,23 @@ class PostprocessConfig:
     eye_validation: EyeValidationConfig = field(default_factory=EyeValidationConfig)
 
 @dataclass
+class MergeSlayConfig:
+    k1: float = 0.25
+    k2: float = 1.0
+    slay_threshold: float = 0.5
+
+@dataclass
+class MergeTemplateSimilarityConfig:
+    similarity_method: str = "l1"
+    template_diff_thresh: float = 0.25
+
+@dataclass
 class MergeConfig:
     enabled: bool = False                                      # auto-merge 默认关闭
+    preset: str = "slay"                                       # SI auto-merge preset
+    resolve_graph: bool = True                                 # resolve pairwise groups
+    slay: MergeSlayConfig = field(default_factory=MergeSlayConfig)
+    template_similarity: MergeTemplateSimilarityConfig = field(default_factory=MergeTemplateSimilarityConfig)
 
 @dataclass
 class PipelineConfig:

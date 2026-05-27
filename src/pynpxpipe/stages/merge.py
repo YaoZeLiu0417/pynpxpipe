@@ -117,10 +117,13 @@ class MergeStage(BaseStage):
 
         from spikeinterface.curation import MergeUnitsSorting, compute_merge_unit_groups
 
+        merge_config = self.session.config.merge
+        steps_params = merge_config.steps_params()
         merge_groups = compute_merge_unit_groups(
             analyzer,
-            preset="slay",
-            resolve_graph=True,
+            preset=merge_config.preset,
+            resolve_graph=merge_config.resolve_graph,
+            steps_params=steps_params,
             extra_outputs=False,
         )
         merge_groups = _normalize_merge_groups(merge_groups)
@@ -155,7 +158,9 @@ class MergeStage(BaseStage):
             for group in merge_groups
         ]
         merge_log = {
-            "preset": "slay",
+            "preset": merge_config.preset,
+            "resolve_graph": merge_config.resolve_graph,
+            "steps_params": steps_params,
             "merges": merges,
             "n_units_before": n_before,
             "n_units_after": n_after,

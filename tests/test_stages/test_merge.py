@@ -13,6 +13,10 @@ from pynpxpipe.core.session import ProbeInfo, Session, SessionManager, SubjectCo
 from pynpxpipe.stages.merge import MergeStage
 
 
+def _default_steps_params() -> dict[str, dict[str, float | str]]:
+    return MergeConfig().steps_params()
+
+
 def _make_subject() -> SubjectConfig:
     return SubjectConfig(
         subject_id="test",
@@ -104,6 +108,7 @@ def test_merge_probe_uses_spikeinterface_slay_preset(session: Session) -> None:
         analyzer,
         preset="slay",
         resolve_graph=True,
+        steps_params=_default_steps_params(),
         extra_outputs=False,
     )
     merge_units_sorting.assert_called_once_with(
@@ -114,6 +119,37 @@ def test_merge_probe_uses_spikeinterface_slay_preset(session: Session) -> None:
     create_analyzer.assert_called_once()
     assert create_analyzer.call_args.kwargs["folder"] == session.output_dir / "03_merged" / "imec0"
     assert create_analyzer.call_args.args[0] is merged_sorting
+
+
+def test_merge_probe_passes_configured_slay_parameters(session: Session) -> None:
+    """Merge config controls the SI SLAy preset and step thresholds."""
+    session.config.merge.resolve_graph = False
+    session.config.merge.template_similarity.similarity_method = "cosine"
+    session.config.merge.template_similarity.template_diff_thresh = 0.4
+    session.config.merge.slay.k1 = 0.4
+    session.config.merge.slay.k2 = 1.5
+    session.config.merge.slay.slay_threshold = 0.65
+    expected_steps = session.config.merge.steps_params()
+
+    analyzer = _make_analyzer([1, 2, 3])
+
+    with (
+        patch("pynpxpipe.stages.merge.si.load", return_value=analyzer),
+        patch("pynpxpipe.stages.merge.si.create_sorting_analyzer"),
+        patch(
+            "spikeinterface.curation.compute_merge_unit_groups",
+            return_value=[],
+        ) as compute_merge_unit_groups,
+    ):
+        MergeStage(session)._merge_probe("imec0")
+
+    compute_merge_unit_groups.assert_called_once_with(
+        analyzer,
+        preset="slay",
+        resolve_graph=False,
+        steps_params=expected_steps,
+        extra_outputs=False,
+    )
 
 
 def test_merge_log_records_slay_groups(session: Session) -> None:
@@ -134,6 +170,8 @@ def test_merge_log_records_slay_groups(session: Session) -> None:
         (session.output_dir / "03_merged" / "imec0" / "merge_log.json").read_text(encoding="utf-8")
     )
     assert merge_log["preset"] == "slay"
+    assert merge_log["resolve_graph"] is True
+    assert merge_log["steps_params"] == _default_steps_params()
     assert merge_log["merges"] == [{"merged_ids": [1, 2], "new_id": 1}]
     assert merge_log["n_units_before"] == 3
     assert merge_log["n_units_after"] == 2

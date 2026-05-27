@@ -127,6 +127,20 @@ def test_real_pipeline_yaml_sync_fields():
     assert config.sync.generate_plots is True
 
 
+def test_real_pipeline_yaml_merge_fields():
+    """Verify merge section values match pipeline.yaml exactly."""
+    config = load_pipeline_config(_pipeline_yaml_path())
+
+    assert config.merge.enabled is False
+    assert config.merge.preset == "slay"
+    assert config.merge.resolve_graph is True
+    assert config.merge.template_similarity.similarity_method == "l1"
+    assert config.merge.template_similarity.template_diff_thresh == 0.25
+    assert config.merge.slay.k1 == 0.25
+    assert config.merge.slay.k2 == 1.0
+    assert config.merge.slay.slay_threshold == 0.5
+
+
 # ===========================================================================
 # Test B: load real sorting.yaml
 # ===========================================================================

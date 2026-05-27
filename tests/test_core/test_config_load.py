@@ -41,6 +41,11 @@ def test_load_pipeline_config_none_returns_defaults():
     assert config.curation.isi_violation_ratio_max == 2.0
     assert config.sync.imec_sync_bit == 6
     assert config.sync.stim_onset_code == 64
+    assert config.merge.enabled is False
+    assert config.merge.preset == "slay"
+    assert config.merge.resolve_graph is True
+    assert config.merge.slay.slay_threshold == 0.5
+    assert config.merge.template_similarity.template_diff_thresh == 0.25
 
 
 def test_load_pipeline_config_nonexistent_path_returns_defaults(tmp_path):
@@ -95,6 +100,36 @@ def test_load_pipeline_config_from_file_reads_fields(tmp_path):
 # ===========================================================================
 # 3. load_pipeline_config(path) file exists but field missing → uses default
 # ===========================================================================
+
+
+def test_load_pipeline_config_reads_merge_nested_fields(tmp_path):
+    """Merge config supports the SLAy preset and nested step parameters."""
+    yaml_content = (
+        "merge:\n"
+        "  enabled: true\n"
+        "  preset: slay\n"
+        "  resolve_graph: false\n"
+        "  template_similarity:\n"
+        "    similarity_method: cosine\n"
+        "    template_diff_thresh: 0.35\n"
+        "  slay:\n"
+        "    k1: 0.4\n"
+        "    k2: 1.5\n"
+        "    slay_threshold: 0.65\n"
+    )
+    config_file = tmp_path / "pipeline.yaml"
+    config_file.write_text(yaml_content, encoding="utf-8")
+
+    config = load_pipeline_config(config_file)
+
+    assert config.merge.enabled is True
+    assert config.merge.preset == "slay"
+    assert config.merge.resolve_graph is False
+    assert config.merge.template_similarity.similarity_method == "cosine"
+    assert config.merge.template_similarity.template_diff_thresh == 0.35
+    assert config.merge.slay.k1 == 0.4
+    assert config.merge.slay.k2 == 1.5
+    assert config.merge.slay.slay_threshold == 0.65
 
 
 def test_load_pipeline_config_missing_field_uses_default(tmp_path):
@@ -245,6 +280,27 @@ def test_merge_with_overrides_updates_field():
 # ===========================================================================
 # 10. merge_with_overrides with invalid value → raises ConfigError
 # ===========================================================================
+
+
+def test_merge_with_overrides_updates_merge_nested_field():
+    """merge_with_overrides preserves and updates nested merge config."""
+    config = load_pipeline_config(None)
+
+    new_config = merge_with_overrides(
+        config,
+        {
+            "merge": {
+                "enabled": True,
+                "slay": {"slay_threshold": 0.7},
+            }
+        },
+    )
+
+    assert new_config.merge.enabled is True
+    assert new_config.merge.preset == "slay"
+    assert new_config.merge.slay.slay_threshold == 0.7
+    assert config.merge.enabled is False
+    assert config.merge.slay.slay_threshold == 0.5
 
 
 def test_merge_with_overrides_invalid_value_raises():
@@ -533,6 +589,9 @@ def test_save_pipeline_config_round_trips_via_load(tmp_path):
     cfg.preprocess.bandpass.freq_min = 250.0
     cfg.sync.imec_sync_bit = 6
     cfg.merge.enabled = True
+    cfg.merge.resolve_graph = False
+    cfg.merge.slay.slay_threshold = 0.7
+    cfg.merge.template_similarity.template_diff_thresh = 0.35
 
     save_pipeline_config(cfg, target)
     assert target.exists()
@@ -542,6 +601,9 @@ def test_save_pipeline_config_round_trips_via_load(tmp_path):
     assert reloaded.preprocess.bandpass.freq_min == 250.0
     assert reloaded.sync.imec_sync_bit == 6
     assert reloaded.merge.enabled is True
+    assert reloaded.merge.resolve_graph is False
+    assert reloaded.merge.slay.slay_threshold == 0.7
+    assert reloaded.merge.template_similarity.template_diff_thresh == 0.35
 
 
 def test_save_sorting_config_round_trips_via_load(tmp_path):

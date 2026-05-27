@@ -5,6 +5,19 @@ export:
     post_onset_ms: auto   # number in ms, or "auto" (→ max(VC.onset_time+offset_time))
     bin_size_ms: 1
     n_jobs: 1
+merge:
+  # Opt-in only: auto-merge changes the unit set, so keep disabled by default.
+  enabled: false
+  # SpikeInterface compute_merge_unit_groups preset. Task 3 uses SI's SLAy preset.
+  preset: slay
+  resolve_graph: true
+  template_similarity:
+    similarity_method: l1
+    template_diff_thresh: 0.25
+  slay:
+    k1: 0.25
+    k2: 1.0
+    slay_threshold: 0.5
 curation:
   # Fallback path (use_bombcell=False) thresholds. Ignored when
   # use_bombcell=True — see curation.bombcell below.

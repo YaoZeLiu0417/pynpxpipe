@@ -375,6 +375,50 @@ class TestCuration:
 # ===========================================================================
 
 
+class TestMerge:
+    def test_defaults_pass(self):
+        cfg = PipelineConfig()
+        _validate_pipeline_config(cfg)
+
+    def test_valid_slay_values_pass(self):
+        cfg = PipelineConfig()
+        cfg.merge.enabled = True
+        cfg.merge.preset = "slay"
+        cfg.merge.resolve_graph = False
+        cfg.merge.slay.k1 = 0.4
+        cfg.merge.slay.k2 = 1.5
+        cfg.merge.slay.slay_threshold = 0.65
+        cfg.merge.template_similarity.similarity_method = "cosine"
+        cfg.merge.template_similarity.template_diff_thresh = 0.35
+        _validate_pipeline_config(cfg)
+
+    def test_invalid_preset_raises(self):
+        cfg = PipelineConfig()
+        cfg.merge.preset = "unknown"
+        with pytest.raises(ConfigError) as exc_info:
+            _validate_pipeline_config(cfg)
+        assert exc_info.value.field == "merge.preset"
+
+    def test_invalid_slay_threshold_raises(self):
+        cfg = PipelineConfig()
+        cfg.merge.slay.slay_threshold = 1.5
+        with pytest.raises(ConfigError) as exc_info:
+            _validate_pipeline_config(cfg)
+        assert exc_info.value.field == "merge.slay.slay_threshold"
+
+    def test_invalid_template_diff_thresh_raises(self):
+        cfg = PipelineConfig()
+        cfg.merge.template_similarity.template_diff_thresh = 0.0
+        with pytest.raises(ConfigError) as exc_info:
+            _validate_pipeline_config(cfg)
+        assert exc_info.value.field == "merge.template_similarity.template_diff_thresh"
+
+
+# ===========================================================================
+# _validate_pipeline_config - sync
+# ===========================================================================
+
+
 class TestSync:
     def test_defaults_pass(self):
         cfg = PipelineConfig()

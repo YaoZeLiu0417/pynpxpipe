@@ -253,6 +253,23 @@ class EyeValidationConfig:
 
 
 @dataclass
+class MergeSlayConfig:
+    """SpikeInterface SLAy score step parameters for auto-merge."""
+
+    k1: float = 0.25
+    k2: float = 1.0
+    slay_threshold: float = 0.5
+
+
+@dataclass
+class MergeTemplateSimilarityConfig:
+    """Template similarity step parameters for auto-merge."""
+
+    similarity_method: str = "l1"
+    template_diff_thresh: float = 0.25
+
+
+@dataclass
 class MergeConfig:
     """Optional auto-merge stage parameters.
 
@@ -260,9 +277,34 @@ class MergeConfig:
         enabled: Whether to run auto_merge(). Default False — merge is
             irreversible, so the user must opt in explicitly after reviewing
             sorting quality.
+        preset: SpikeInterface auto-merge preset. Defaults to ``"slay"``.
+        resolve_graph: Whether SI should resolve pairwise candidates into
+            multi-unit merge groups.
+        slay: SLAy score step parameters.
+        template_similarity: Template similarity step parameters.
     """
 
     enabled: bool = False
+    preset: str = "slay"
+    resolve_graph: bool = True
+    slay: MergeSlayConfig = field(default_factory=MergeSlayConfig)
+    template_similarity: MergeTemplateSimilarityConfig = field(
+        default_factory=MergeTemplateSimilarityConfig
+    )
+
+    def steps_params(self) -> dict[str, dict[str, float | str]]:
+        """Return SpikeInterface ``compute_merge_unit_groups`` step parameters."""
+        return {
+            "template_similarity": {
+                "similarity_method": self.template_similarity.similarity_method,
+                "template_diff_thresh": self.template_similarity.template_diff_thresh,
+            },
+            "slay_score": {
+                "k1": self.slay.k1,
+                "k2": self.slay.k2,
+                "slay_threshold": self.slay.slay_threshold,
+            },
+        }
 
 
 @dataclass
@@ -652,7 +694,7 @@ def _build_postprocess(raw: dict) -> PostprocessConfig:
 
 
 def _build_merge(raw: dict) -> MergeConfig:
-    """Build a MergeConfig from a raw YAML dict.
+    """Build a MergeConfig from a raw YAML dict, recursing into sub-sections.
 
     Args:
         raw: Mapping of merge config keys. Unknown keys are ignored.
@@ -660,7 +702,21 @@ def _build_merge(raw: dict) -> MergeConfig:
     Returns:
         MergeConfig with known keys applied and defaults for the rest.
     """
-    return MergeConfig(**_extract_known(raw, MergeConfig))
+    slay = MergeSlayConfig(**_extract_known(raw.get("slay") or {}, MergeSlayConfig))
+    template_similarity = MergeTemplateSimilarityConfig(
+        **_extract_known(
+            raw.get("template_similarity") or {},
+            MergeTemplateSimilarityConfig,
+        )
+    )
+
+    handled = {"slay", "template_similarity"}
+    top_known = _extract_known({k: v for k, v in raw.items() if k not in handled}, MergeConfig)
+    return MergeConfig(
+        slay=slay,
+        template_similarity=template_similarity,
+        **top_known,
+    )
 
 
 def _build_derivatives(raw: dict) -> DerivativesConfig:
@@ -887,6 +943,48 @@ def _validate_pipeline_config(config: PipelineConfig) -> None:
     # curation.good_snr_min
     if c.good_snr_min < 0.0:
         raise ConfigError("curation.good_snr_min", c.good_snr_min, "must be >= 0.0")
+
+    m = config.merge
+    valid_merge_presets = {
+        "similarity_correlograms",
+        "temporal_splits",
+        "x_contaminations",
+        "feature_neighbors",
+        "slay",
+    }
+    if m.preset not in valid_merge_presets:
+        raise ConfigError(
+            "merge.preset",
+            m.preset,
+            f"must be one of {sorted(valid_merge_presets)}",
+        )
+    if not isinstance(m.resolve_graph, bool):
+        raise ConfigError("merge.resolve_graph", m.resolve_graph, "must be a bool")
+    if m.slay.k1 <= 0.0:
+        raise ConfigError("merge.slay.k1", m.slay.k1, "must be > 0.0")
+    if m.slay.k2 <= 0.0:
+        raise ConfigError("merge.slay.k2", m.slay.k2, "must be > 0.0")
+    if not (0.0 <= m.slay.slay_threshold <= 1.0):
+        raise ConfigError(
+            "merge.slay.slay_threshold",
+            m.slay.slay_threshold,
+            "must satisfy 0.0 <= x <= 1.0",
+        )
+    if (
+        not isinstance(m.template_similarity.similarity_method, str)
+        or not m.template_similarity.similarity_method
+    ):
+        raise ConfigError(
+            "merge.template_similarity.similarity_method",
+            m.template_similarity.similarity_method,
+            "must be a non-empty string",
+        )
+    if m.template_similarity.template_diff_thresh <= 0.0:
+        raise ConfigError(
+            "merge.template_similarity.template_diff_thresh",
+            m.template_similarity.template_diff_thresh,
+            "must be > 0.0",
+        )
 
     s = config.sync
     # sync.imec_sync_bit (AP)
@@ -1332,6 +1430,7 @@ def merge_with_overrides(
             curation=_build_curation(merged.get("curation") or {}),
             sync=_build_sync(merged.get("sync") or {}),
             postprocess=_build_postprocess(merged.get("postprocess") or {}),
+            merge=_build_merge(merged.get("merge") or {}),
             export=_build_export(merged.get("export") or {}),
         )
         _validate_pipeline_config(new_config)
