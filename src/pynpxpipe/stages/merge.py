@@ -1,4 +1,4 @@
-"""Optional auto-merge stage using SpikeInterface auto_merge().
+"""Optional auto-merge stage using SpikeInterface SLAy auto-merge.
 
 Default OFF (config.merge.enabled = False). When enabled, merges similar
 units to reduce over-splitting. Creates a new SortingAnalyzer in
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class MergeStage(BaseStage):
-    """Optional auto-merge stage using SpikeInterface auto_merge().
+    """Optional auto-merge stage using SpikeInterface SLAy auto-merge.
 
     Default OFF (config.merge.enabled = False). When enabled, merges
     similar units to reduce over-splitting. Creates a new SortingAnalyzer
@@ -85,7 +85,7 @@ class MergeStage(BaseStage):
         """Auto-merge one probe's sorted units.
 
         Loads the sorted SortingAnalyzer, ensures required extensions are
-        computed, runs auto_merge(), and saves the merged result to a new
+        computed, runs SLAy merge-group detection, and saves the merged result to a new
         binary_folder. The original sorted output is not modified.
 
         Args:
@@ -106,7 +106,8 @@ class MergeStage(BaseStage):
 
         n_before = len(analyzer.sorting.get_unit_ids())
 
-        # Ensure required extensions for auto_merge
+        # Ensure core extensions for SLAy auto-merge. SpikeInterface can
+        # compute additional preset-specific extensions internally.
         if not analyzer.has_extension("templates"):
             analyzer.compute("random_spikes")
             analyzer.compute("waveforms")
@@ -114,9 +115,25 @@ class MergeStage(BaseStage):
         if not analyzer.has_extension("template_similarity"):
             analyzer.compute("template_similarity")
 
-        from spikeinterface.curation import auto_merge
+        from spikeinterface.curation import MergeUnitsSorting, compute_merge_unit_groups
 
-        merged_sorting, merge_info = auto_merge(analyzer, return_merge_info=True)
+        merge_groups = compute_merge_unit_groups(
+            analyzer,
+            preset="slay",
+            resolve_graph=True,
+            extra_outputs=False,
+        )
+        merge_groups = _normalize_merge_groups(merge_groups)
+        new_unit_ids = [group[0] for group in merge_groups]
+        merged_sorting = (
+            MergeUnitsSorting(
+                analyzer.sorting,
+                merge_groups,
+                new_unit_ids=new_unit_ids,
+            )
+            if merge_groups
+            else analyzer.sorting
+        )
 
         merged_dir = self.session.output_dir / "03_merged" / probe_id
         merged_analyzer = si.create_sorting_analyzer(
@@ -130,12 +147,15 @@ class MergeStage(BaseStage):
         n_after = len(merged_sorting.get_unit_ids())
 
         # Write merge_log.json
-        merges = []
-        if hasattr(merge_info, "merge_unit_groups"):
-            for group in merge_info.merge_unit_groups:
-                if len(group) > 1:
-                    merges.append({"merged_ids": [int(u) for u in group], "new_id": int(group[0])})
+        merges = [
+            {
+                "merged_ids": [_json_safe_unit_id(unit_id) for unit_id in group],
+                "new_id": _json_safe_unit_id(group[0]),
+            }
+            for group in merge_groups
+        ]
         merge_log = {
+            "preset": "slay",
             "merges": merges,
             "n_units_before": n_before,
             "n_units_after": n_after,
@@ -165,3 +185,20 @@ class MergeStage(BaseStage):
 
         del analyzer, merged_analyzer
         gc.collect()
+
+
+def _normalize_merge_groups(merge_groups: list | tuple) -> list[tuple]:
+    """Return only valid multi-unit merge groups as tuples."""
+    normalized: list[tuple] = []
+    for group in merge_groups:
+        group_tuple = tuple(group)
+        if len(group_tuple) > 1:
+            normalized.append(group_tuple)
+    return normalized
+
+
+def _json_safe_unit_id(unit_id: object) -> int | str:
+    try:
+        return int(unit_id)
+    except (TypeError, ValueError):
+        return str(unit_id)
