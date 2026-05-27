@@ -107,7 +107,7 @@
 ### `_curate_probe(probe_id) -> tuple[int, int]`
 
 1. **检查 per-probe checkpoint**：`_is_complete(probe_id=probe_id)` → 若已完成则 return `(0, 0)`（或从 checkpoint 读出已记录的值）
-2. **加载 sorting**：从 `{output_dir}/02_02_sorted/{probe_id}/` 加载，`si.load(sorted_path)`
+2. **加载 sorting**：若 `config.merge.enabled=True`，从 `{output_dir}/03_merged/{probe_id}/` 加载，且缺失即报错；否则从 `{output_dir}/02_sorted/{probe_id}/` 加载，`si.load(sorting_path)`
 3. **加载预处理录制**（用于计算 noise levels）：从 `{output_dir}/01_01_preprocessed/{probe_id}/` lazy 加载
 4. **创建 in-memory SortingAnalyzer**：
    ```python

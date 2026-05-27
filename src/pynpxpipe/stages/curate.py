@@ -145,11 +145,11 @@ class CurateStage(BaseStage):
         if self._is_complete(probe_id=probe_id):
             return (0, 0)
 
-        sorted_path = self.session.output_dir / "02_sorted" / probe_id
+        sorting_path = self._sorting_input_path(probe_id)
         recording_path = self.session.output_dir / "01_preprocessed" / f"{probe_id}.zarr"
 
         try:
-            sorting = si.load(sorted_path)
+            sorting = si.load(sorting_path)
             recording = si.load(recording_path)
         except Exception as exc:
             raise CurateError(f"Failed to load data for {probe_id}: {exc}") from exc
@@ -283,6 +283,7 @@ class CurateStage(BaseStage):
                     "presence_ratio_min": curation.presence_ratio_min,
                     "snr_min": curation.snr_min,
                 },
+                "sorting_input_path": str(sorting_path),
             },
             probe_id=probe_id,
         )
@@ -291,6 +292,20 @@ class CurateStage(BaseStage):
         gc.collect()
 
         return (n_before, n_after)
+
+    def _sorting_input_path(self, probe_id: str):
+        """Return the sorting source for curation, respecting optional merge."""
+        if self.session.config.merge.enabled:
+            merged_path = self.session.output_dir / "03_merged" / probe_id
+            if not merged_path.exists():
+                raise CurateError(
+                    "Merge is enabled but merged analyzer is missing for "
+                    f"{probe_id}: {merged_path}. Run the merge stage first or "
+                    "disable config.merge.enabled."
+                )
+            return merged_path
+
+        return self.session.output_dir / "02_sorted" / probe_id
 
     def _classify_bombcell(
         self, analyzer: si.SortingAnalyzer, qm
@@ -372,10 +387,13 @@ class CurateStage(BaseStage):
                 continue
             if "amplitude_cutoff" in qm.columns:
                 amp = qm.loc[uid, "amplitude_cutoff"]
-                if amp is not None and not (amp != amp):  # not NaN
-                    if float(amp) > curation.amplitude_cutoff_max:
-                        unittype_map[uid] = "NOISE"
-                        continue
+                if (
+                    amp is not None
+                    and amp == amp  # not NaN
+                    and float(amp) > curation.amplitude_cutoff_max
+                ):
+                    unittype_map[uid] = "NOISE"
+                    continue
 
             # ISI/SNR classification
             if isi <= curation.good_isi_max and snr_val >= curation.good_snr_min:

@@ -349,6 +349,69 @@ class TestNormalFlow:
 # ---------------------------------------------------------------------------
 
 
+class TestSortingInputSelection:
+    def test_merge_disabled_loads_sorted_output(self, single_session: Session) -> None:
+        """Default curate input is the original sort output."""
+        unit_ids = ["u0"]
+        mock_sorting, mock_recording, mock_analyzer, _ = _patch_curate(unit_ids)
+
+        with (
+            patch(
+                "pynpxpipe.stages.curate.si.load",
+                side_effect=[mock_sorting, mock_recording],
+            ) as mock_load,
+            patch(
+                "pynpxpipe.stages.curate.si.create_sorting_analyzer",
+                return_value=mock_analyzer,
+            ),
+            patch("pynpxpipe.stages.curate.gc"),
+        ):
+            CurateStage(single_session)._curate_probe("imec0")
+
+        assert mock_load.call_args_list[0].args[0] == (
+            single_session.output_dir / "02_sorted" / "imec0"
+        )
+
+    def test_merge_enabled_loads_merged_output(self, single_session: Session) -> None:
+        """When merge is enabled, curate consumes 03_merged instead of 02_sorted."""
+        single_session.config.merge.enabled = True
+        (single_session.output_dir / "03_merged" / "imec0").mkdir(parents=True)
+        unit_ids = ["u0"]
+        mock_sorting, mock_recording, mock_analyzer, _ = _patch_curate(unit_ids)
+
+        with (
+            patch(
+                "pynpxpipe.stages.curate.si.load",
+                side_effect=[mock_sorting, mock_recording],
+            ) as mock_load,
+            patch(
+                "pynpxpipe.stages.curate.si.create_sorting_analyzer",
+                return_value=mock_analyzer,
+            ),
+            patch("pynpxpipe.stages.curate.gc"),
+        ):
+            CurateStage(single_session)._curate_probe("imec0")
+
+        merged_path = single_session.output_dir / "03_merged" / "imec0"
+        assert mock_load.call_args_list[0].args[0] == merged_path
+
+        cp = single_session.output_dir / "checkpoints" / "curate_imec0.json"
+        data = json.loads(cp.read_text(encoding="utf-8"))
+        assert data["sorting_input_path"] == str(merged_path)
+
+    def test_merge_enabled_missing_output_raises(self, single_session: Session) -> None:
+        """Missing 03_merged is an explicit error, not a silent fallback."""
+        single_session.config.merge.enabled = True
+
+        with (
+            patch("pynpxpipe.stages.curate.si.load") as mock_load,
+            pytest.raises(CurateError, match="03_merged"),
+        ):
+            CurateStage(single_session)._curate_probe("imec0")
+
+        mock_load.assert_not_called()
+
+
 class TestFilterLogic:
     def test_units_passing_all_thresholds_kept(self, single_session: Session) -> None:
         """Units within all threshold bounds are selected (select_units called with them)."""
