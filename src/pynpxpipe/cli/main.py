@@ -17,14 +17,20 @@ from pathlib import Path
 import click
 
 from pynpxpipe.core.checkpoint import CheckpointManager
-from pynpxpipe.core.config import load_pipeline_config, load_sorting_config, load_subject_config
+from pynpxpipe.core.config import (
+    load_pipeline_config,
+    load_sorting_config,
+    load_subject_config,
+    save_pipeline_config,
+)
 from pynpxpipe.core.errors import PynpxpipeError
 from pynpxpipe.core.session import SessionManager
 from pynpxpipe.pipelines.nwb_rerun import rerun_from_nwb
 from pynpxpipe.pipelines.runner import STAGE_ORDER, PipelineRunner
 from pynpxpipe.stages.export import ExportStage
 
-_PER_PROBE_STAGES = {"preprocess", "sort", "curate", "postprocess"}
+_PER_PROBE_STAGES = {"preprocess", "sort", "merge", "curate", "postprocess"}
+_MERGE_ROLLBACK_STAGES = ("merge", "curate", "postprocess", "export")
 
 
 class _CliProgressBar:
@@ -210,15 +216,41 @@ def reset_stage(output_dir: Path, stage: str, yes: bool) -> None:
             abort=True,
         )
 
+    _clear_stage_checkpoints(output_dir, stage)
+
+    click.echo("Reset complete.")
+
+
+@cli.command("rollback-merge")
+@click.argument("output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
+def rollback_merge(output_dir: Path, yes: bool) -> None:
+    """Disable merge and reset downstream checkpoints for an unmerged rerun."""
+    if not yes:
+        click.confirm(
+            "Rollback merge for this output directory? This keeps 03_merged but "
+            "resets merge/curate/postprocess/export checkpoints.",
+            abort=True,
+        )
+
+    used_pipeline = output_dir / "used_pipeline.yaml"
+    cfg = load_pipeline_config(used_pipeline if used_pipeline.exists() else None)
+    cfg.merge.enabled = False
+    save_pipeline_config(cfg, used_pipeline)
+
+    for stage in _MERGE_ROLLBACK_STAGES:
+        _clear_stage_checkpoints(output_dir, stage)
+
+    click.echo("Merge rollback prepared. Re-run curate/postprocess/export.")
+
+
+def _clear_stage_checkpoints(output_dir: Path, stage: str) -> None:
     checkpoint_manager = CheckpointManager(output_dir)
     checkpoint_manager.clear(stage)
 
-    if stage in _PER_PROBE_STAGES:
-        cp_dir = output_dir / "checkpoints"
-        for probe_cp in cp_dir.glob(f"{stage}_*.json"):
-            probe_cp.unlink(missing_ok=True)
-
-    click.echo("Reset complete.")
+    cp_dir = output_dir / "checkpoints"
+    for probe_cp in cp_dir.glob(f"{stage}_*.json"):
+        probe_cp.unlink(missing_ok=True)
 
 
 @cli.command("rerun-derivatives")

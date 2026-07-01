@@ -4,9 +4,10 @@ Groups:
   A. run command                — success, error handling, stages option, required options
   B. status command             — output format for completed/pending/failed stages
   C. reset-stage cmd            — checkpoint deletion, --yes flag, confirmation prompt
-  D. Architecture               — click not imported in business layer, no sys.exit in business layer
-  E. verify-safe-to-delete cmd  — E2.3 exit codes + path listing
-  F. rerun-from-nwb cmd         — Task 2 NWB rerun thin-shell entry
+  D. rollback-merge cmd         — disable merge + reset downstream checkpoints
+  E. Architecture               — click not imported in business layer, no sys.exit in business layer
+  F. verify-safe-to-delete cmd  — E2.3 exit codes + path listing
+  G. rerun-from-nwb cmd         — Task 2 NWB rerun thin-shell entry
 """
 
 from __future__ import annotations
@@ -503,6 +504,47 @@ class TestResetStageCommand:
 # ---------------------------------------------------------------------------
 # Group D — Architecture constraints
 # ---------------------------------------------------------------------------
+
+
+class TestRollbackMergeCommand:
+    def test_disables_merge_in_used_pipeline(self, tmp_path: Path) -> None:
+        """rollback-merge turns off merge in the effective pipeline config."""
+        from pynpxpipe.core.config import load_pipeline_config, save_pipeline_config
+
+        output_dir = _make_output_dir(tmp_path)
+        cfg = load_pipeline_config(None)
+        cfg.merge.enabled = True
+        save_pipeline_config(cfg, output_dir / "used_pipeline.yaml")
+
+        result = CliRunner().invoke(cli, ["rollback-merge", str(output_dir), "--yes"])
+
+        assert result.exit_code == 0, result.output
+        reloaded = load_pipeline_config(output_dir / "used_pipeline.yaml")
+        assert reloaded.merge.enabled is False
+
+    def test_clears_downstream_checkpoints_without_deleting_merged_output(
+        self, tmp_path: Path
+    ) -> None:
+        """rollback-merge only resets checkpoints; merge artifacts stay auditable."""
+        output_dir = _make_output_dir(tmp_path)
+        cp_dir = output_dir / "checkpoints"
+        cp_dir.mkdir(exist_ok=True)
+        for stage in ["merge", "curate", "postprocess", "export", "sort"]:
+            (cp_dir / f"{stage}.json").write_text("{}", encoding="utf-8")
+            (cp_dir / f"{stage}_imec0.json").write_text("{}", encoding="utf-8")
+        merged_dir = output_dir / "03_merged" / "imec0"
+        merged_dir.mkdir(parents=True)
+        (merged_dir / "merge_log.json").write_text("{}", encoding="utf-8")
+
+        result = CliRunner().invoke(cli, ["rollback-merge", str(output_dir), "--yes"])
+
+        assert result.exit_code == 0, result.output
+        for stage in ["merge", "curate", "postprocess", "export"]:
+            assert not (cp_dir / f"{stage}.json").exists()
+            assert not (cp_dir / f"{stage}_imec0.json").exists()
+        assert (cp_dir / "sort.json").exists()
+        assert (cp_dir / "sort_imec0.json").exists()
+        assert merged_dir.exists()
 
 
 class TestArchitectureConstraints:
