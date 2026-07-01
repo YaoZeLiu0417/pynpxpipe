@@ -677,23 +677,49 @@ def test_pipeline_form_parallel_max_workers_auto_mode():
 
 
 def test_pipeline_form_has_merge_widget():
-    """PipelineForm exposes merge_enabled_checkbox widget."""
+    """PipelineForm exposes merge parameter widgets."""
     from pynpxpipe.ui.components.pipeline_form import PipelineForm
 
     state = AppState()
     form = PipelineForm(state)
-    assert hasattr(form, "merge_enabled_checkbox")
+    for name in [
+        "merge_enabled_checkbox",
+        "merge_preset_select",
+        "merge_resolve_graph_checkbox",
+        "merge_slay_k1_input",
+        "merge_slay_k2_input",
+        "merge_slay_threshold_input",
+        "merge_similarity_method_input",
+        "merge_template_diff_thresh_input",
+    ]:
+        assert hasattr(form, name)
 
 
 def test_pipeline_form_merge_default_disabled():
-    """Merge checkbox defaults to False and toggling it updates state.pipeline_config.merge.enabled."""
+    """Merge widgets update state.pipeline_config.merge."""
     from pynpxpipe.ui.components.pipeline_form import PipelineForm
 
     state = AppState()
     form = PipelineForm(state)
     assert state.pipeline_config.merge.enabled is False
     form.merge_enabled_checkbox.value = True
-    assert state.pipeline_config.merge.enabled is True
+    form.merge_preset_select.value = "feature_neighbors"
+    form.merge_resolve_graph_checkbox.value = False
+    form.merge_slay_k1_input.value = 0.3
+    form.merge_slay_k2_input.value = 1.5
+    form.merge_slay_threshold_input.value = 0.7
+    form.merge_similarity_method_input.value = "l2"
+    form.merge_template_diff_thresh_input.value = 0.35
+
+    merge = state.pipeline_config.merge
+    assert merge.enabled is True
+    assert merge.preset == "feature_neighbors"
+    assert merge.resolve_graph is False
+    assert merge.slay.k1 == 0.3
+    assert merge.slay.k2 == 1.5
+    assert merge.slay.slay_threshold == 0.7
+    assert merge.template_similarity.similarity_method == "l2"
+    assert merge.template_similarity.template_diff_thresh == 0.35
 
 
 # ─── C.2 Curation extensions (use_bombcell, good_isi, good_snr) ───
@@ -1463,6 +1489,13 @@ PIPELINE_FORM_FIELD_TO_WIDGET = {
     "postprocess.eye_validation.enabled": "eye_enabled_checkbox",
     "postprocess.eye_validation.eye_threshold": "eye_threshold_input",
     "merge.enabled": "merge_enabled_checkbox",
+    "merge.preset": "merge_preset_select",
+    "merge.resolve_graph": "merge_resolve_graph_checkbox",
+    "merge.slay.k1": "merge_slay_k1_input",
+    "merge.slay.k2": "merge_slay_k2_input",
+    "merge.slay.slay_threshold": "merge_slay_threshold_input",
+    "merge.template_similarity.similarity_method": "merge_similarity_method_input",
+    "merge.template_similarity.template_diff_thresh": "merge_template_diff_thresh_input",
     "curation.bombcell.amplitude_median_min": "bombcell_amplitude_median_min_input",
     "curation.bombcell.num_spikes_min": "bombcell_num_spikes_min_input",
     "curation.bombcell.presence_ratio_min": "bombcell_presence_ratio_min_input",
@@ -1633,6 +1666,8 @@ def test_pipeline_form_apply_pipeline_round_trips_via_state():
         ExportConfig,
         EyeValidationConfig,
         MergeConfig,
+        MergeSlayConfig,
+        MergeTemplateSimilarityConfig,
         MotionCorrectionConfig,
         ParallelConfig,
         PipelineConfig,
@@ -1702,7 +1737,16 @@ def test_pipeline_form_apply_pipeline_round_trips_via_state():
             pre_onset_ms=40.0,
             eye_validation=EyeValidationConfig(enabled=False, eye_threshold=0.95),
         ),
-        merge=MergeConfig(enabled=True),
+        merge=MergeConfig(
+            enabled=True,
+            preset="feature_neighbors",
+            resolve_graph=False,
+            slay=MergeSlayConfig(k1=0.3, k2=1.5, slay_threshold=0.7),
+            template_similarity=MergeTemplateSimilarityConfig(
+                similarity_method="l2",
+                template_diff_thresh=0.35,
+            ),
+        ),
         export=ExportConfig(
             derivatives=DerivativesConfig(
                 enabled=False,
@@ -1750,6 +1794,13 @@ def test_pipeline_form_apply_pipeline_round_trips_via_state():
     assert actual.postprocess.eye_validation.enabled is False
     # Merge / Export
     assert actual.merge.enabled is True
+    assert actual.merge.preset == "feature_neighbors"
+    assert actual.merge.resolve_graph is False
+    assert actual.merge.slay.k1 == 0.3
+    assert actual.merge.slay.k2 == 1.5
+    assert actual.merge.slay.slay_threshold == 0.7
+    assert actual.merge.template_similarity.similarity_method == "l2"
+    assert actual.merge.template_similarity.template_diff_thresh == 0.35
     assert actual.export.derivatives.enabled is False
     assert actual.export.derivatives.post_onset_ms == 400.0
 

@@ -16,6 +16,8 @@ from pynpxpipe.core.config import (
     ExportConfig,
     EyeValidationConfig,
     MergeConfig,
+    MergeSlayConfig,
+    MergeTemplateSimilarityConfig,
     MotionCorrectionConfig,
     ParallelConfig,
     PipelineConfig,
@@ -426,6 +428,47 @@ class PipelineForm:
             name="Enable auto-merge stage (irreversible; review sorting quality first)",
             value=_DEFAULTS.merge.enabled,
         )
+        self.merge_preset_select = pn.widgets.Select(
+            name="Merge Preset",
+            options=[
+                "similarity_correlograms",
+                "temporal_splits",
+                "x_contaminations",
+                "feature_neighbors",
+                "slay",
+            ],
+            value=_DEFAULTS.merge.preset,
+        )
+        self.merge_resolve_graph_checkbox = pn.widgets.Checkbox(
+            name="Resolve Merge Graph",
+            value=_DEFAULTS.merge.resolve_graph,
+        )
+        self.merge_slay_k1_input = pn.widgets.FloatInput(
+            name="SLAy k1",
+            value=_DEFAULTS.merge.slay.k1,
+            step=0.01,
+        )
+        self.merge_slay_k2_input = pn.widgets.FloatInput(
+            name="SLAy k2",
+            value=_DEFAULTS.merge.slay.k2,
+            step=0.1,
+        )
+        self.merge_slay_threshold_input = pn.widgets.FloatInput(
+            name="SLAy Threshold",
+            value=_DEFAULTS.merge.slay.slay_threshold,
+            start=0.0,
+            end=1.0,
+            step=0.05,
+        )
+        self.merge_similarity_method_input = pn.widgets.TextInput(
+            name="Similarity Method",
+            value=_DEFAULTS.merge.template_similarity.similarity_method,
+        )
+        self.merge_template_diff_thresh_input = pn.widgets.FloatInput(
+            name="Template Diff Threshold",
+            value=_DEFAULTS.merge.template_similarity.template_diff_thresh,
+            step=0.05,
+        )
 
         # ── Export (Phase 2.5 derivatives) ──
         _deriv = _DEFAULTS.export.derivatives
@@ -509,6 +552,13 @@ class PipelineForm:
             self.eye_enabled_checkbox,
             self.eye_threshold_input,
             self.merge_enabled_checkbox,
+            self.merge_preset_select,
+            self.merge_resolve_graph_checkbox,
+            self.merge_slay_k1_input,
+            self.merge_slay_k2_input,
+            self.merge_slay_threshold_input,
+            self.merge_similarity_method_input,
+            self.merge_template_diff_thresh_input,
             self.derivatives_enabled_checkbox,
             self.derivatives_pre_onset_ms_input,
             self.derivatives_post_onset_ms_input,
@@ -633,7 +683,23 @@ class PipelineForm:
                     eye_threshold=self.eye_threshold_input.value,
                 ),
             ),
-            merge=MergeConfig(enabled=self.merge_enabled_checkbox.value),
+            merge=MergeConfig(
+                enabled=self.merge_enabled_checkbox.value,
+                preset=self.merge_preset_select.value,
+                resolve_graph=self.merge_resolve_graph_checkbox.value,
+                slay=MergeSlayConfig(
+                    k1=self.merge_slay_k1_input.value,
+                    k2=self.merge_slay_k2_input.value,
+                    slay_threshold=self.merge_slay_threshold_input.value,
+                ),
+                template_similarity=MergeTemplateSimilarityConfig(
+                    similarity_method=(
+                        self.merge_similarity_method_input.value
+                        or _DEFAULTS.merge.template_similarity.similarity_method
+                    ),
+                    template_diff_thresh=self.merge_template_diff_thresh_input.value,
+                ),
+            ),
             export=ExportConfig(
                 derivatives=DerivativesConfig(
                     enabled=self.derivatives_enabled_checkbox.value,
@@ -730,7 +796,15 @@ class PipelineForm:
         self.eye_enabled_checkbox.value = post.eye_validation.enabled
         self.eye_threshold_input.value = post.eye_validation.eye_threshold
         # Merge
-        self.merge_enabled_checkbox.value = cfg.merge.enabled
+        merge = cfg.merge
+        self.merge_enabled_checkbox.value = merge.enabled
+        self.merge_preset_select.value = merge.preset
+        self.merge_resolve_graph_checkbox.value = merge.resolve_graph
+        self.merge_slay_k1_input.value = merge.slay.k1
+        self.merge_slay_k2_input.value = merge.slay.k2
+        self.merge_slay_threshold_input.value = merge.slay.slay_threshold
+        self.merge_similarity_method_input.value = merge.template_similarity.similarity_method
+        self.merge_template_diff_thresh_input.value = merge.template_similarity.template_diff_thresh
         # Export derivatives
         deriv = cfg.export.derivatives
         self.derivatives_enabled_checkbox.value = deriv.enabled
@@ -832,6 +906,13 @@ class PipelineForm:
             ),
             pn.Card(
                 self.merge_enabled_checkbox,
+                self.merge_preset_select,
+                self.merge_resolve_graph_checkbox,
+                self.merge_slay_k1_input,
+                self.merge_slay_k2_input,
+                self.merge_slay_threshold_input,
+                self.merge_similarity_method_input,
+                self.merge_template_diff_thresh_input,
                 title="Auto-Merge (opt-in, irreversible)",
                 collapsed=True,
             ),
