@@ -8,12 +8,20 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+import psutil
 
 from pynpxpipe.core.checkpoint import CheckpointManager
 from pynpxpipe.core.config import save_pipeline_config, save_sorting_config
-from pynpxpipe.core.resources import ResourceDetector
+from pynpxpipe.core.resources import (
+    ResourceDetector,
+    ResourceTuning,
+    recommend_motion_strategy,
+)
 from pynpxpipe.pipelines.constants import PER_PROBE_STAGES, STAGE_ORDER
 
 if TYPE_CHECKING:
@@ -22,6 +30,21 @@ if TYPE_CHECKING:
 
 # Re-export for backward compat (tests, CLI, etc.)
 __all__ = ["PipelineRunner", "STAGE_ORDER"]
+
+_LOG = logging.getLogger(__name__)
+
+# Default DREDge nonrigid window count (B) when probe geometry is unavailable.
+# NP1.0 (~3840 µm span) / win_step_um(400) ≈ 10. Override via motion_correction.n_windows.
+_DEFAULT_N_WINDOWS = 10
+
+
+def _read_meta_value(meta_path: Path, key: str) -> str | None:
+    """Return the raw value for ``key=`` in a SpikeGLX ``.meta`` file, or None."""
+    for line in Path(meta_path).read_text(errors="ignore").splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip()
+    return None
+
 
 # Internal alias
 _PER_PROBE_STAGES = PER_PROBE_STAGES
@@ -72,7 +95,20 @@ class PipelineRunner:
         if needs_auto:
             detector = ResourceDetector(self.session.session_dir, self.session.output_dir)
             profile = detector.detect()
-            rec = detector.recommend(profile, session.probes or None)
+            rc = pipeline_config.resources
+            tuning = ResourceTuning(
+                reserve_cores=rc.reserve_cores,
+                n_jobs_cap=rc.n_jobs_cap,
+                ram_safety_factor=rc.ram_safety_factor,
+                ram_reserve_gb=rc.ram_reserve_gb,
+                chunk_ram_fraction=rc.chunk_ram_fraction,
+                chunk_max_s=rc.chunk_max_s,
+                max_workers_cap=rc.max_workers_cap,
+                max_workers_ram_fraction=rc.max_workers_ram_fraction,
+                vram_safety_factor=rc.vram_safety_factor,
+                vram_overhead_gb=rc.vram_overhead_gb,
+            )
+            rec = detector.recommend(profile, session.probes or None, tuning=tuning)
             if pipeline_config.resources.n_jobs == "auto":
                 pipeline_config.resources.n_jobs = rec.n_jobs
             if pipeline_config.resources.chunk_duration == "auto":
@@ -124,7 +160,11 @@ class PipelineRunner:
             to_run = list(STAGE_ORDER)
 
         for stage_name in to_run:
+            if stage_name == "preprocess":
+                self._resolve_motion_strategy()
             self.run_stage(stage_name)
+            if stage_name == "postprocess":
+                self._cleanup_preprocessed_zarr()
 
     def run_stage(self, stage_name: str) -> None:
         """Instantiate and run a single stage by name.
@@ -162,6 +202,110 @@ class PipelineRunner:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _cleanup_preprocessed_zarr(self) -> None:
+        """Delete each probe's preprocessed Zarr once its postprocess is done.
+
+        Runs after the postprocess stage (the Zarr's last consumer). Frees the
+        ~half-of-raw intermediate before the export NWB is built. Only deletes a
+        probe's Zarr when that probe's postprocess checkpoint is complete, so it
+        is resume-safe and never removes data a pending stage still needs. Never
+        raises — a failed unlink only logs a warning.
+        """
+        if not self.pipeline_config.preprocess.delete_zarr_after_postprocess:
+            return
+        preprocessed_dir = self.session.output_dir / "01_preprocessed"
+        for probe in self.session.probes or []:
+            if not self._checkpoint.is_complete("postprocess", probe.probe_id):
+                continue
+            zarr_path = preprocessed_dir / f"{probe.probe_id}.zarr"
+            if not zarr_path.exists():
+                continue
+            try:
+                shutil.rmtree(zarr_path)
+                _LOG.info(
+                    "Deleted preprocessed Zarr after postprocess (%s): %s",
+                    probe.probe_id,
+                    zarr_path,
+                )
+            except OSError as exc:
+                _LOG.warning(
+                    "Failed to delete preprocessed Zarr (%s) at %s: %s",
+                    probe.probe_id,
+                    zarr_path,
+                    exc,
+                )
+
+    def _resolve_motion_strategy(self) -> None:
+        """Predict DREDge memory and set ``bin_s`` / fallback before preprocess.
+
+        Only acts when motion is DREDge and ``auto_strategy`` is on and the
+        recording is long enough to risk OOM. Picks the highest-precision
+        ``bin_s`` that fits RAM, or disables DREDge and sets ``nblocks``. Never
+        raises — any failure logs a warning and leaves the DREDge config intact.
+        """
+        mc = self.pipeline_config.preprocess.motion_correction
+        if mc.method != "dredge" or not getattr(mc, "auto_strategy", False):
+            return
+        if not self.session.probes:
+            return
+        try:
+            duration = self._max_recording_duration_s()
+            if duration is None or duration < mc.probe_threshold_s:
+                return
+            strategy = recommend_motion_strategy(
+                duration_s=duration,
+                n_windows=self._estimate_n_windows(),
+                available_bytes=psutil.virtual_memory().available,
+                bin_s_floor=mc.bin_s_floor,
+                bin_s_max=mc.bin_s_max,
+                bytes_per_entry=mc.bytes_per_entry,
+                n_matrices=mc.n_matrices,
+                overhead_reserve_bytes=int(mc.overhead_reserve_gb * 1024**3),
+                ram_safety_factor=mc.ram_safety_factor,
+                fallback_nblocks=mc.fallback_nblocks,
+            )
+            for note in strategy.notes:
+                _LOG.info("motion advisor: %s", note)
+            if strategy.use_dredge:
+                mc.bin_s = strategy.bin_s
+            else:
+                mc.method = None
+                self.sorting_config.sorter.params.nblocks = strategy.fallback_nblocks
+                _LOG.warning(
+                    "motion advisor: DREDge disabled → sort uses nblocks=%d (%s)",
+                    strategy.fallback_nblocks,
+                    strategy.reason,
+                )
+        except Exception as exc:  # advisor must never block the pipeline
+            _LOG.warning("motion advisor failed (%s); keeping DREDge config", exc)
+
+    def _max_recording_duration_s(self) -> float | None:
+        """Longest probe duration (s), from ``fileTimeSecs`` in each ap.meta."""
+        durations: list[float] = []
+        for probe in self.session.probes or []:
+            meta = getattr(probe, "ap_meta", None)
+            if not (meta and Path(meta).exists()):
+                continue
+            raw = _read_meta_value(Path(meta), "fileTimeSecs")
+            if raw is None:
+                # Fallback: fileSizeBytes / (nSavedChans * 2 bytes) / imSampRate.
+                size = _read_meta_value(Path(meta), "fileSizeBytes")
+                n_ch = _read_meta_value(Path(meta), "nSavedChans")
+                rate = _read_meta_value(Path(meta), "imSampRate")
+                if size and n_ch and rate:
+                    raw = str(int(size) / (int(n_ch) * 2) / float(rate))
+            if raw is not None:
+                try:
+                    durations.append(float(raw))
+                except ValueError:
+                    continue
+        return max(durations) if durations else None
+
+    def _estimate_n_windows(self) -> int:
+        """DREDge nonrigid window count B (config override or default)."""
+        mc = self.pipeline_config.preprocess.motion_correction
+        return int(mc.n_windows) if getattr(mc, "n_windows", None) else _DEFAULT_N_WINDOWS
 
     def _build_stage(self, stage_name: str):  # noqa: ANN202
         """Instantiate the correct stage class with appropriate args."""

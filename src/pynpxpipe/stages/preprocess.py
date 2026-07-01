@@ -68,7 +68,7 @@ class PreprocessStage(BaseStage):
         4. Detect and remove bad channels (on filtered data).
         5. Common median reference.
         6. Motion correction if config.preprocess.motion_correction.method not None.
-        7. Save to Zarr at {output_dir}/01_01_preprocessed/{probe_id}/.
+        7. Save to Zarr at {output_dir}/01_preprocessed/{probe_id}.zarr.
         8. Write per-probe checkpoint; del recording + gc.collect().
 
         Raises:
@@ -82,10 +82,12 @@ class PreprocessStage(BaseStage):
         self._setup_spikeinterface_jobs(self.pipeline_config)
 
         if not self.session.probes:
-            raise PreprocessError(
+            err = PreprocessError(
                 "No probes in session. The discover stage may not have run or "
                 "failed to populate probes. Re-run from discover."
             )
+            self._write_failed_checkpoint(err)
+            raise err
 
         n_probes = len(self.session.probes)
         for i, probe in enumerate(self.session.probes):
@@ -149,15 +151,24 @@ class PreprocessStage(BaseStage):
 
         # Step 7: optional motion correction
         if cfg.preprocess.motion_correction.method is not None:
+            # bin_s controls DREDge's temporal bin (T = duration/bin_s); memory of
+            # the (B, T, T) correlation matrices scales ~1/bin_s². The runner's
+            # motion advisor may raise bin_s to keep DREDge within RAM.
             recording = spp.correct_motion(
                 recording,
                 preset=cfg.preprocess.motion_correction.preset,
+                estimate_motion_kwargs={"bin_s": cfg.preprocess.motion_correction.bin_s},
             )
 
-        # Step 8: save as Zarr
+        # Step 8: save as Zarr.
+        # Cast to save_dtype (default int16): with motion correction the chain is
+        # float32 (interpolation), so int16 halves disk at ~0.5-ADC-count cost.
+        # astype rounds to nearest and preserves gain_to_uV, so downstream µV is
+        # exact and KS4 (which re-whitens) is unaffected. The in-memory `recording`
+        # is left untouched for the diagnostic figures below.
         zarr_path = self.session.output_dir / "01_preprocessed" / f"{probe_id}.zarr"
         try:
-            recording.save(
+            recording.astype(cfg.preprocess.save_dtype).save(
                 folder=zarr_path,
                 format="zarr",
             )

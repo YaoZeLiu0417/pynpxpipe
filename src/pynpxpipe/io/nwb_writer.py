@@ -11,6 +11,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -507,6 +508,9 @@ class NWBWriter:
         probe: ProbeInfo,
         analyzer: si.SortingAnalyzer,
         rasters: dict | None = None,
+        *,
+        raw_channel_positions: list[tuple[float, float]] | None = None,
+        inter_sample_shift: np.ndarray | None = None,
     ) -> None:
         """Add all data for one probe to the NWBFile.
 
@@ -542,23 +546,41 @@ class NWBWriter:
             device=device,
         )
 
-        # Resolve channel positions: prefer ProbeInfo, fallback to analyzer probe
-        channel_positions = probe.channel_positions
-        if not channel_positions:
-            try:
-                pi_probe = analyzer.get_probe()
-                positions = pi_probe.contact_positions  # (n_contacts, 2)
-                channel_positions = [(float(x), float(y)) for x, y in positions]
-            except Exception:
-                channel_positions = []
+        # Resolve channel positions: raw geometry (full physical channels, from
+        # the raw AP recording) takes precedence so the stored electrode table
+        # matches the raw stream width and can carry inter_sample_shift; else
+        # fall back to ProbeInfo / analyzer (curated) geometry. cf. nwb_writer.md §9.
+        if raw_channel_positions is not None:
+            channel_positions = list(raw_channel_positions)
+        else:
+            channel_positions = probe.channel_positions
+            if not channel_positions:
+                try:
+                    pi_probe = analyzer.get_probe()
+                    positions = pi_probe.contact_positions  # (n_contacts, 2)
+                    channel_positions = [(float(x), float(y)) for x, y in positions]
+                except Exception:
+                    channel_positions = []
+
+        write_shift = inter_sample_shift is not None
 
         # Add electrode table columns and rows only if we have channel data
         if channel_positions:
             if self._nwbfile.electrodes is None:
                 self._nwbfile.add_electrode_column("probe_id", "Probe identifier")
                 self._nwbfile.add_electrode_column("channel_id", "Channel index within probe")
+                if write_shift:
+                    self._nwbfile.add_electrode_column(
+                        "inter_sample_shift",
+                        "Per-channel ADC sample shift (fraction of sample period) for phase_shift",
+                    )
 
             for ch_idx, (x, y) in enumerate(channel_positions):
+                # inter_sample_shift aligns with channel_positions order (both
+                # come from the same raw recording's channel order).
+                extra = (
+                    {"inter_sample_shift": float(inter_sample_shift[ch_idx])} if write_shift else {}
+                )
                 self._nwbfile.add_electrode(
                     x=float(x),
                     y=float(y),
@@ -568,6 +590,7 @@ class NWBWriter:
                     location=probe.target_area,
                     probe_id=probe.probe_id,
                     channel_id=ch_idx,
+                    **extra,
                 )
 
         # Extract extension data
@@ -579,6 +602,20 @@ class NWBWriter:
             all_templates_std = templates_ext.get_templates(operator="std")
         except Exception:
             all_templates_std = np.zeros_like(all_templates)
+
+        # Pad templates to the probe's full physical channel count so the shared
+        # units-table `waveform_mean` / `waveform_std` columns stay rectangular
+        # ACROSS probes. preprocess removes a data-dependent number of bad
+        # channels per probe, so each probe's analyzer templates have a different
+        # width; without this padding, combining probes makes the column ragged
+        # and HDMF raises "setting an array element with a sequence ...
+        # inhomogeneous shape" at write time. Missing channels are NaN-filled.
+        # Assumes homogeneous probe channel counts (NP1.0/2.0 → 384).
+        n_full = max(int(getattr(probe, "n_channels", 0) or 0), all_templates.shape[2])
+        if all_templates.shape[2] < n_full:
+            pad = ((0, 0), (0, 0), (0, n_full - all_templates.shape[2]))
+            all_templates = np.pad(all_templates, pad, constant_values=np.nan)
+            all_templates_std = np.pad(all_templates_std, pad, constant_values=np.nan)
 
         all_locations = unit_locs_ext.get_data()  # (n_units, 2 or 3)
 
@@ -593,10 +630,8 @@ class NWBWriter:
                 self.session.output_dir / "06_postprocessed" / probe.probe_id / "slay_scores.json"
             )
             if slay_path.exists():
-                try:
+                with suppress(Exception):
                     slay_scores_data = json.loads(slay_path.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
 
         unit_ids = list(analyzer.sorting.get_unit_ids())
 
@@ -1241,10 +1276,9 @@ class NWBWriter:
             raise RuntimeError("call create_file() before add_ks4_sorting()")
 
         sorter_output_path = Path(sorter_output_path)
-        try:
-            from pynwb.ecephys import ElectricalSeries
-            from pynwb.misc import Units
-
+        # KS4 metadata is optional; export should not fail if these sidecar
+        # files are absent or malformed.
+        with suppress(Exception):
             amplitudes_path = sorter_output_path / "amplitudes.npy"
             templates_path = sorter_output_path / "spike_templates.npy"
 
@@ -1279,9 +1313,6 @@ class NWBWriter:
                     description=f"KS4 spike template assignments for {probe_id}",
                 )
             )
-        except Exception:
-            # KS4 metadata is optional — do not fail the export
-            pass
 
     def append_raw_data(
         self,
@@ -1402,6 +1433,20 @@ class NWBWriter:
                 if nidq_info is not None:
                     streams_written.append("NIDQ_raw")
                     written_streams.append(nidq_info)
+
+            # Archive each probe's raw .ap.meta verbatim for full SpikeGLX
+            # provenance (channel map, gains, ADC layout). Lets NWB-input
+            # re-sort recover any SpikeGLX metadata. Idempotent. cf. §9.
+            for probe in session.probes:
+                scratch_key = f"ap_meta_{probe.probe_id}"
+                if scratch_key in nwbfile.scratch:
+                    continue
+                if probe.ap_meta is not None and Path(probe.ap_meta).exists():
+                    nwbfile.add_scratch(
+                        data=Path(probe.ap_meta).read_text(encoding="utf-8"),
+                        name=scratch_key,
+                        description=f"Raw SpikeGLX .ap.meta for {probe.probe_id}",
+                    )
 
             io.write(nwbfile)
 

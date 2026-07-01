@@ -57,7 +57,7 @@ uv run python tools/install_sort_stack.py
 ```bash
 git clone https://github.com/GongZhengxin/pynpxpipe.git
 cd pynpxpipe
-uv sync --all-groups
+uv sync --inexact --all-groups
 
 # One-time sort stack install (see Mode A step 2 for why)
 uv run python tools/install_sort_stack.py
@@ -97,6 +97,75 @@ uv run python tools/install_sort_stack.py --yes --force
 ```bash
 uv run pynpxpipe --version
 uv run pynpxpipe --help
+```
+
+## 1b. Deploy to a New Machine (full install checklist)
+
+Use this when standing up pynpxpipe on a fresh machine for production
+preprocessing. **Full** means every runtime extra (UI + GPU detection + plots +
+chat); only `matlab` is skipped (it needs a MATLAB install).
+
+Prerequisites: Python 3.11/3.12 (not 3.13), uv, NVIDIA driver (for Kilosort4).
+
+```bash
+git clone https://github.com/GongZhengxin/pynpxpipe.git
+cd pynpxpipe
+
+# Full sync — --inexact is mandatory; do NOT use --all-extras (it would pull matlab)
+uv sync --inexact --all-groups --extra ui --extra gpu --extra plots --extra chat
+
+# One-time sort stack (picks a CUDA wheel for your GPU + driver)
+uv run python tools/install_sort_stack.py
+
+# Self-check
+uv run python tools/verify_gpu.py     # must report cuda=True, no MISMATCH
+uv run pynpxpipe --help
+uv run pynpxpipe-ui                    # browser opens http://localhost:5006
+```
+
+Three things that bite on a fresh machine:
+
+1. **Every later `uv sync` must pass `--inexact`** — otherwise the CUDA torch
+   you just installed is replaced by the PyPI CPU wheel and sorting silently
+   falls back to CPU.
+2. **Long recordings (> ~2 h) risk a DREDge OOM** — the motion advisor (on by
+   default) auto-tunes for this; see the note below.
+3. **Offline / air-gapped machines** need the repo + wheel cache pre-staged
+   (install pulls from GitHub + PyPI + pytorch.org).
+
+> **NWB completeness note:** producing a self-contained NWB that can later be
+> re-preprocessed from the single file (phase_shift recoverable) requires the
+> `inter_sample_shift` / geometry / `.ap.meta` persistence fix (commit
+> `687f2a3`). Deploy a branch that contains it (landed on `main` 2026-06-26).
+
+### Long recordings (> ~2 h): DREDge memory
+
+DREDge's peak memory is the `(B, T, T)` float32 cross-correlation matrices it
+builds during motion estimation, where `B` is the number of nonrigid windows and
+`T = duration / bin_s` (default `bin_s = 1 s`). Memory therefore scales
+~`B · (duration / bin_s)²` — quadratic in duration, and largely independent of
+firing rate. A 5.2 h dual-probe session OOM'd on 91 GB this way.
+
+pynpxpipe's **motion advisor** (`motion_correction.auto_strategy`, on by default)
+predicts this before preprocess and either raises `bin_s` to the highest temporal
+precision that still fits available RAM, or — if even the coarsest acceptable
+`bin_s` won't fit — disables DREDge and falls back to Kilosort4's internal
+`nblocks` drift correction. So a long run "just works" on a big machine and
+degrades gracefully on a tight one. See `docs/specs/motion_memory_advisor.md`.
+
+To control it manually (advisor off, or to override): raising `bin_s` cuts the
+matrix memory by `1/bin_s²` at the cost of drift time-resolution; or switch to
+nblocks (mutually exclusive with DREDge):
+
+```yaml
+# pipeline.yaml — coarser DREDge bin (¼ the memory at bin_s=2), or disable it
+motion_correction:
+  bin_s: 2.0
+  # method: null   # disable DREDge entirely instead
+# sorting.yaml — KS4 internal drift blocks (use when DREDge is disabled)
+sorter:
+  params:
+    nblocks: 5
 ```
 
 ## 2. Prepare Your Data
@@ -283,9 +352,11 @@ D:/output/my_session/
     discover.json                # Stage checkpoint
     preprocess_imec0.json        # Per-probe checkpoint
     preprocess_imec1.json        # (if multi-probe)
-  preprocessed/
-    imec0/                       # Zarr recording (chunked, memory-efficient)
-    imec1/                       # (if multi-probe)
+  01_preprocessed/
+    imec0.zarr/                  # Zarr recording (chunked, memory-efficient)
+    imec0/
+      figures/                   # Optional preprocess QC figures
+    imec1.zarr/                  # (if multi-probe)
 ```
 
 ### Preprocessing Steps (per probe)
@@ -385,16 +456,17 @@ Subject:
 
 | Problem | Solution |
 |---------|----------|
-| `ModuleNotFoundError: No module named 'panel'` | Install UI extra: `uv sync --extra ui` |
+| `ModuleNotFoundError: No module named 'panel'` | Install UI extra: `uv sync --inexact --extra ui` |
 | `ModuleNotFoundError: No module named 'torch'` | Run `uv run python tools/install_sort_stack.py` (torch lives outside pyproject; see install guide) |
 | `The dredge method require torch: pip install torch` | Same — run the sort stack installer; DREDge needs `torch` |
 | `ModuleNotFoundError: No module named 'kilosort'` | Same — run the sort stack installer |
 | `TorchEnvError: torch_device='cuda' was requested ... CPU-only build` | Your torch is the CPU wheel. Run `uv run python tools/install_sort_stack.py --force` and pick a CUDA wheel matching your driver |
 | `TorchEnvError: torch_device='cuda' was requested but no NVIDIA GPU` | Set `torch_device: cpu` (or `auto`) in `config/sorting.yaml` |
-| `pynpxpipe-ui` command not found | Run via `uv run pynpxpipe-ui` or install with `uv sync` |
+| `pynpxpipe-ui` command not found | Run via `uv run pynpxpipe-ui` or install with `uv sync --inexact` |
 | UI doesn't open in browser | Navigate manually to `http://localhost:5006` |
 | Out of memory during preprocess | Reduce `chunk_duration` (e.g., `"0.5s"`) or lower `n_jobs` in `pipeline.yaml` |
+| Out of memory on a long session (> ~2 h) during motion correction | DREDge's `(B,T,T)` correlation matrices scale ~`(duration/bin_s)²`. The motion advisor (`auto_strategy`, on by default) auto-raises `bin_s` or falls back to `nblocks`; if it's off, set `motion_correction.bin_s` higher or `method: null` + `sorter.params.nblocks: 5` (see §1b) |
 | Motion correction + KS4 nblocks conflict | These are mutually exclusive. Set motion correction to `null` if using KS4 nblocks > 0, or set nblocks to 0 if using DREDge |
-| GPU not detected for sorting | Install GPU extra: `uv sync --extra gpu`. Ensure CUDA drivers are installed |
+| GPU not detected for sorting | Install GPU extra: `uv sync --inexact --extra gpu`. Ensure CUDA drivers are installed |
 | Pipeline stuck on a stage | Check `logs/pipeline.jsonl` for errors. Use `reset-stage` to clear the checkpoint and retry |
 | BHV2 parsing errors | pynpxpipe uses a pure-Python parser by default. Set `BHV2_BACKEND=matlab` to use MATLAB Engine as fallback (requires MATLAB) |

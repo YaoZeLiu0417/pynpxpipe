@@ -16,14 +16,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pynpxpipe.core.config import (
+    MotionCorrectionConfig,
     ParallelConfig,
     PipelineConfig,
+    PreprocessConfig,
     ResourcesConfig,
     SorterConfig,
     SorterParams,
     SortingConfig,
 )
 from pynpxpipe.core.errors import SortError
+from pynpxpipe.core.resources import MotionStrategy
 from pynpxpipe.core.session import ProbeInfo, Session, SessionManager, SubjectConfig
 from pynpxpipe.pipelines.runner import STAGE_ORDER, PipelineRunner
 
@@ -292,6 +295,28 @@ class TestAutoConfig:
 
         mock_cls.assert_not_called()
 
+    def test_recommend_receives_tuning_from_config(self, session: Session) -> None:
+        """resources.* tuning fields flow into ResourceTuning passed to recommend()."""
+        mock_detector_cls = MagicMock()
+        mock_detector = mock_detector_cls.return_value
+        mock_detector.detect.return_value = MagicMock()
+        mock_detector.recommend.return_value = MagicMock(
+            n_jobs=4, chunk_duration="2s", max_workers=1, sorting_batch_size=65792
+        )
+
+        cfg = _make_pipeline_config(n_jobs="auto")
+        cfg.resources.reserve_cores = 0
+        cfg.resources.n_jobs_cap = 7
+        cfg.resources.vram_safety_factor = 0.95
+
+        with patch("pynpxpipe.pipelines.runner.ResourceDetector", mock_detector_cls):
+            PipelineRunner(session, cfg, _make_sorting_config(batch_size=65792))
+
+        tuning = mock_detector.recommend.call_args.kwargs["tuning"]
+        assert tuning.reserve_cores == 0
+        assert tuning.n_jobs_cap == 7
+        assert tuning.vram_safety_factor == 0.95
+
     def test_auto_batch_size_resolved(self, session: Session) -> None:
         """batch_size='auto' → ResourceDetector called and batch_size updated."""
         mock_detector_cls = MagicMock()
@@ -444,3 +469,155 @@ class TestRunnerEffectiveConfigDump:
             reloaded_sorting.sorter.params.batch_size
             == runner.sorting_config.sorter.params.batch_size
         )
+
+
+# ---------------------------------------------------------------------------
+# Group E — Motion strategy resolution (DREDge memory advisor wiring)
+# ---------------------------------------------------------------------------
+
+
+def _motion_pipeline_config(*, method="dredge", auto_strategy=True, **mc):
+    return PipelineConfig(
+        resources=ResourcesConfig(n_jobs=4, chunk_duration="1s"),
+        parallel=ParallelConfig(max_workers=1),
+        preprocess=PreprocessConfig(
+            motion_correction=MotionCorrectionConfig(
+                method=method, auto_strategy=auto_strategy, **mc
+            )
+        ),
+    )
+
+
+def _dredge_strategy(bin_s=1.8):
+    return MotionStrategy(
+        use_dredge=True,
+        bin_s=bin_s,
+        n_windows=10,
+        n_time_bins=8400,
+        predicted_peak_bytes=1,
+        available_bytes=2,
+        budget_bytes=2,
+        fallback_nblocks=5,
+        reason="fits",
+        notes=["x"],
+    )
+
+
+def _fallback_strategy():
+    return MotionStrategy(
+        use_dredge=False,
+        bin_s=None,
+        n_windows=10,
+        n_time_bins=6240,
+        predicted_peak_bytes=9,
+        available_bytes=2,
+        budget_bytes=1,
+        fallback_nblocks=5,
+        reason="too big",
+        notes=["x"],
+    )
+
+
+class TestMotionStrategyWiring:
+    def test_skips_when_method_not_dredge(self, session: Session) -> None:
+        runner = PipelineRunner(
+            session, _motion_pipeline_config(method=None), _make_sorting_config()
+        )
+        with patch("pynpxpipe.pipelines.runner.recommend_motion_strategy") as rec:
+            runner._resolve_motion_strategy()
+        rec.assert_not_called()
+
+    def test_skips_when_auto_strategy_off(self, session: Session) -> None:
+        runner = PipelineRunner(
+            session, _motion_pipeline_config(auto_strategy=False), _make_sorting_config()
+        )
+        with patch("pynpxpipe.pipelines.runner.recommend_motion_strategy") as rec:
+            runner._resolve_motion_strategy()
+        rec.assert_not_called()
+
+    def test_skips_short_recording(self, session: Session) -> None:
+        runner = PipelineRunner(session, _motion_pipeline_config(), _make_sorting_config())
+        with (
+            patch.object(runner, "_max_recording_duration_s", return_value=600.0),
+            patch("pynpxpipe.pipelines.runner.recommend_motion_strategy") as rec,
+        ):
+            runner._resolve_motion_strategy()
+        rec.assert_not_called()
+
+    def test_tight_writes_bin_s_keeps_dredge(self, session: Session) -> None:
+        runner = PipelineRunner(session, _motion_pipeline_config(), _make_sorting_config())
+        with (
+            patch.object(runner, "_max_recording_duration_s", return_value=15120.0),
+            patch.object(runner, "_estimate_n_windows", return_value=10),
+            patch(
+                "pynpxpipe.pipelines.runner.recommend_motion_strategy",
+                return_value=_dredge_strategy(bin_s=1.8),
+            ),
+        ):
+            runner._resolve_motion_strategy()
+        mc = runner.pipeline_config.preprocess.motion_correction
+        assert mc.bin_s == 1.8
+        assert mc.method == "dredge"
+        assert runner.sorting_config.sorter.params.nblocks == 0  # unchanged
+
+    def test_extreme_disables_dredge_sets_nblocks(self, session: Session) -> None:
+        runner = PipelineRunner(session, _motion_pipeline_config(), _make_sorting_config())
+        with (
+            patch.object(runner, "_max_recording_duration_s", return_value=18720.0),
+            patch.object(runner, "_estimate_n_windows", return_value=10),
+            patch(
+                "pynpxpipe.pipelines.runner.recommend_motion_strategy",
+                return_value=_fallback_strategy(),
+            ),
+        ):
+            runner._resolve_motion_strategy()
+        mc = runner.pipeline_config.preprocess.motion_correction
+        assert mc.method is None
+        assert runner.sorting_config.sorter.params.nblocks == 5
+
+
+# ---------------------------------------------------------------------------
+# Preprocessed-Zarr cleanup after postprocess
+# ---------------------------------------------------------------------------
+
+
+class TestPreprocessedCleanup:
+    def _make_zarr(self, session: Session, probe_id: str) -> Path:
+        z = session.output_dir / "01_preprocessed" / f"{probe_id}.zarr"
+        z.mkdir(parents=True, exist_ok=True)
+        (z / ".zattrs").write_text("{}", encoding="utf-8")
+        return z
+
+    def test_deletes_zarr_after_postprocess_complete(self, session: Session) -> None:
+        runner = _make_runner(session)
+        z0 = self._make_zarr(session, "imec0")
+        z1 = self._make_zarr(session, "imec1")
+        _write_checkpoint(session, "postprocess", probe_id="imec0")
+        _write_checkpoint(session, "postprocess", probe_id="imec1")
+
+        runner._cleanup_preprocessed_zarr()
+
+        assert not z0.exists()
+        assert not z1.exists()
+
+    def test_keeps_zarr_when_flag_off(self, session: Session) -> None:
+        runner = _make_runner(session)
+        runner.pipeline_config.preprocess.delete_zarr_after_postprocess = False
+        z0 = self._make_zarr(session, "imec0")
+        _write_checkpoint(session, "postprocess", probe_id="imec0")
+
+        runner._cleanup_preprocessed_zarr()
+
+        assert z0.exists()
+
+    def test_keeps_zarr_for_incomplete_probe(self, session: Session) -> None:
+        runner = _make_runner(session)
+        z0 = self._make_zarr(session, "imec0")
+        z1 = self._make_zarr(session, "imec1")
+        # only imec0 finished postprocess
+        _write_checkpoint(session, "postprocess", probe_id="imec0")
+
+        runner._cleanup_preprocessed_zarr()
+
+        assert not z0.exists()
+        assert z1.exists()

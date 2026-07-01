@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pynpxpipe.core.config import MergeConfig, PipelineConfig
+from pynpxpipe.core.errors import MergeError
 from pynpxpipe.core.session import ProbeInfo, Session, SessionManager, SubjectConfig
 from pynpxpipe.stages.merge import MergeStage
 
@@ -44,13 +45,13 @@ def _make_probe(probe_id: str, base: Path) -> ProbeInfo:
 
 
 @pytest.fixture
-def session(tmp_path: Path) -> Session:
+def merge_session(tmp_path: Path) -> Session:
     session_dir = tmp_path / "session_g0"
     session_dir.mkdir()
     bhv_file = tmp_path / "test.bhv2"
     bhv_file.write_bytes(b"\x00" * 30)
     output_dir = tmp_path / "output"
-    s = SessionManager.create(
+    session = SessionManager.create(
         session_dir,
         bhv_file,
         _make_subject(),
@@ -59,33 +60,56 @@ def session(tmp_path: Path) -> Session:
         probe_plan={"imec0": "V4"},
         date="240101",
     )
-    s.probes = [_make_probe("imec0", tmp_path)]
-    s.config = PipelineConfig(merge=MergeConfig(enabled=True))
-    return s
+    session.probes = [_make_probe("imec0", tmp_path)]
+    session.config = PipelineConfig(merge=MergeConfig(enabled=True))
+    return session
 
 
-def _make_analyzer(unit_ids: list[int]) -> MagicMock:
+def _make_analyzer(unit_ids: list[int], *, has_extensions: bool = True) -> MagicMock:
     sorting = MagicMock()
     sorting.get_unit_ids.return_value = unit_ids
     analyzer = MagicMock()
     analyzer.sorting = sorting
     analyzer.recording = MagicMock()
-    analyzer.has_extension.return_value = True
+    analyzer.has_extension.return_value = has_extensions
     return analyzer
 
 
-def test_skip_when_disabled(session: Session) -> None:
-    """MergeStage returns immediately when config.merge.enabled is false."""
-    session.config.merge.enabled = False
+def test_disabled_merge_skips_without_processing(merge_session: Session) -> None:
+    merge_session.config.merge.enabled = False
 
-    with patch("pynpxpipe.stages.merge.si.load") as load:
-        MergeStage(session).run()
+    with patch.object(MergeStage, "_merge_probe") as mock_merge:
+        MergeStage(merge_session).run()
 
-    load.assert_not_called()
+    mock_merge.assert_not_called()
 
 
-def test_merge_probe_uses_spikeinterface_slay_preset(session: Session) -> None:
-    """Task 3 requires the SpikeInterface SLAy preset, not SI's default preset."""
+def test_load_failure_raises_merge_error(merge_session: Session) -> None:
+    with (
+        patch("pynpxpipe.stages.merge.si.load", side_effect=RuntimeError("missing sorted")),
+        pytest.raises(MergeError, match="imec0"),
+    ):
+        MergeStage(merge_session)._merge_probe("imec0")
+
+
+def test_unexpected_probe_error_wrapped_as_merge_error(merge_session: Session) -> None:
+    with (
+        patch.object(
+            MergeStage,
+            "_merge_probe",
+            side_effect=RuntimeError("auto_merge failed"),
+        ),
+        pytest.raises(MergeError, match="Failed to merge imec0"),
+    ):
+        MergeStage(merge_session).run()
+
+    cp = merge_session.output_dir / "checkpoints" / "merge_imec0.json"
+    data = json.loads(cp.read_text(encoding="utf-8"))
+    assert data["status"] == "failed"
+    assert "Failed to merge imec0" in data["error"]
+
+
+def test_merge_probe_uses_spikeinterface_slay_preset(merge_session: Session) -> None:
     analyzer = _make_analyzer([1, 2, 3])
     merged_sorting = MagicMock()
     merged_sorting.get_unit_ids.return_value = [3, 1]
@@ -102,7 +126,7 @@ def test_merge_probe_uses_spikeinterface_slay_preset(session: Session) -> None:
             return_value=merged_sorting,
         ) as merge_units_sorting,
     ):
-        MergeStage(session)._merge_probe("imec0")
+        MergeStage(merge_session)._merge_probe("imec0")
 
     compute_merge_unit_groups.assert_called_once_with(
         analyzer,
@@ -117,19 +141,20 @@ def test_merge_probe_uses_spikeinterface_slay_preset(session: Session) -> None:
         new_unit_ids=[1],
     )
     create_analyzer.assert_called_once()
-    assert create_analyzer.call_args.kwargs["folder"] == session.output_dir / "03_merged" / "imec0"
+    assert create_analyzer.call_args.kwargs["folder"] == (
+        merge_session.output_dir / "03_merged" / "imec0"
+    )
     assert create_analyzer.call_args.args[0] is merged_sorting
 
 
-def test_merge_probe_passes_configured_slay_parameters(session: Session) -> None:
-    """Merge config controls the SI SLAy preset and step thresholds."""
-    session.config.merge.resolve_graph = False
-    session.config.merge.template_similarity.similarity_method = "cosine"
-    session.config.merge.template_similarity.template_diff_thresh = 0.4
-    session.config.merge.slay.k1 = 0.4
-    session.config.merge.slay.k2 = 1.5
-    session.config.merge.slay.slay_threshold = 0.65
-    expected_steps = session.config.merge.steps_params()
+def test_merge_probe_passes_configured_slay_parameters(merge_session: Session) -> None:
+    merge_session.config.merge.resolve_graph = False
+    merge_session.config.merge.template_similarity.similarity_method = "cosine"
+    merge_session.config.merge.template_similarity.template_diff_thresh = 0.4
+    merge_session.config.merge.slay.k1 = 0.4
+    merge_session.config.merge.slay.k2 = 1.5
+    merge_session.config.merge.slay.slay_threshold = 0.65
+    expected_steps = merge_session.config.merge.steps_params()
 
     analyzer = _make_analyzer([1, 2, 3])
 
@@ -141,7 +166,7 @@ def test_merge_probe_passes_configured_slay_parameters(session: Session) -> None
             return_value=[],
         ) as compute_merge_unit_groups,
     ):
-        MergeStage(session)._merge_probe("imec0")
+        MergeStage(merge_session)._merge_probe("imec0")
 
     compute_merge_unit_groups.assert_called_once_with(
         analyzer,
@@ -152,9 +177,8 @@ def test_merge_probe_passes_configured_slay_parameters(session: Session) -> None
     )
 
 
-def test_merge_log_records_slay_groups(session: Session) -> None:
-    """merge_log.json records enough history to audit or roll back SLAy merges."""
-    analyzer = _make_analyzer([1, 2, 3])
+def test_merge_log_records_slay_groups_and_checkpoint(merge_session: Session) -> None:
+    analyzer = _make_analyzer([1, 2, 3], has_extensions=False)
     merged_sorting = MagicMock()
     merged_sorting.get_unit_ids.return_value = [3, 1]
 
@@ -164,14 +188,23 @@ def test_merge_log_records_slay_groups(session: Session) -> None:
         patch("spikeinterface.curation.compute_merge_unit_groups", return_value=[(1, 2)]),
         patch("spikeinterface.curation.MergeUnitsSorting", return_value=merged_sorting),
     ):
-        MergeStage(session)._merge_probe("imec0")
+        MergeStage(merge_session)._merge_probe("imec0")
 
-    merge_log = json.loads(
-        (session.output_dir / "03_merged" / "imec0" / "merge_log.json").read_text(encoding="utf-8")
-    )
+    analyzer.compute.assert_any_call("random_spikes")
+    analyzer.compute.assert_any_call("waveforms")
+    analyzer.compute.assert_any_call("templates")
+    analyzer.compute.assert_any_call("template_similarity")
+
+    merged_dir = merge_session.output_dir / "03_merged" / "imec0"
+    merge_log = json.loads((merged_dir / "merge_log.json").read_text(encoding="utf-8"))
     assert merge_log["preset"] == "slay"
     assert merge_log["resolve_graph"] is True
     assert merge_log["steps_params"] == _default_steps_params()
     assert merge_log["merges"] == [{"merged_ids": [1, 2], "new_id": 1}]
     assert merge_log["n_units_before"] == 3
     assert merge_log["n_units_after"] == 2
+
+    cp = merge_session.output_dir / "checkpoints" / "merge_imec0.json"
+    data = json.loads(cp.read_text(encoding="utf-8"))
+    assert data["status"] == "completed"
+    assert data["n_merges"] == 1

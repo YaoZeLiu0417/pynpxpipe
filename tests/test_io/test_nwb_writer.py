@@ -385,6 +385,41 @@ class TestAddProbeData:
         assert "imec1" in w._nwbfile.electrode_groups
         assert len(w._nwbfile.units.id.data) == 5  # 2 + 3
 
+    def test_two_probes_different_channel_counts_waveform_rectangular(
+        self,
+        session: Session,
+        tmp_path: Path,
+    ) -> None:
+        """Probes with different surviving-channel counts → rectangular waveform column.
+
+        preprocess removes a data-dependent number of bad channels per probe, so
+        each probe's templates have a different width. Without padding, the shared
+        units-table waveform_mean column is ragged and HDMF raises
+        "inhomogeneous shape" at write time. The writer pads to the full physical
+        channel count (probe.n_channels) so the column is rectangular.
+        """
+        (tmp_path / "probe0").mkdir(exist_ok=True)
+        (tmp_path / "probe1").mkdir(exist_ok=True)
+        meta0 = _make_meta_file(tmp_path / "probe0")
+        meta1 = _make_meta_file(tmp_path / "probe1")
+        probe0 = _make_probe("imec0", meta0, n_ch=_N_CHANNELS)  # full = 4
+        probe1 = _make_probe("imec1", meta1, n_ch=_N_CHANNELS)
+        session.probes = [probe0, probe1]
+
+        w = NWBWriter(session, tmp_path / "out.nwb")
+        w.create_file()
+        # imec0 kept 3 channels, imec1 kept 2 (different bad-channel counts)
+        w.add_probe_data(probe0, _make_mock_analyzer(n_units=2, n_channels=3))
+        w.add_probe_data(probe1, _make_mock_analyzer(n_units=3, n_channels=2))
+
+        wf = w._nwbfile.units["waveform_mean"].data
+        # Building a single ndarray over all 5 units must NOT raise (rectangular).
+        arr = np.array([np.asarray(x) for x in wf])
+        assert arr.shape == (5, _N_SAMPLES, _N_CHANNELS)
+        # padded (removed) channels are NaN-filled
+        assert np.isnan(arr[0, 0, _N_CHANNELS - 1])  # imec0 unit: ch 3 padded
+        assert np.isnan(arr[2, 0, _N_CHANNELS - 1])  # imec1 unit: chs 2,3 padded
+
     def test_add_probe_without_create_file_raises(
         self, session: Session, tmp_path: Path, probe: ProbeInfo
     ) -> None:
@@ -593,9 +628,7 @@ def _stim_df(stim_index: list[int]) -> pd.DataFrame:
             "trial_id": list(range(n)),
             "onset_nidq_s": [float(i) for i in range(n)],
             "stim_onset_nidq_s": [float(i) + 0.1 for i in range(n)],
-            "stim_onset_imec_s": [
-                _json.dumps({"imec0": float(i) + 0.11}) for i in range(n)
-            ],
+            "stim_onset_imec_s": [_json.dumps({"imec0": float(i) + 0.11}) for i in range(n)],
             "condition_id": [1] * n,
             "trial_valid": [True] * n,
             "stim_index": list(stim_index),
@@ -1207,9 +1240,7 @@ class TestPhase3ProgressCallback:
 
         writer = NWBWriter(session, nwb_path)
         with patch("pynpxpipe.io.nwb_writer.SpikeGLXLoader.load_ap", return_value=rec):
-            writer.append_raw_data(
-                session, nwb_path, time_range=(0.0, 0.1), progress_callback=cb
-            )
+            writer.append_raw_data(session, nwb_path, time_range=(0.0, 0.1), progress_callback=cb)
 
         assert len(calls) > 0, "progress_callback was never invoked"
 
@@ -1565,9 +1596,7 @@ def _make_writer_with_nwbfile(session: Session, tmp_path: Path) -> NWBWriter:
 class TestAddSyncTables:
     """Tests for NWBWriter.add_sync_tables (E1.3)."""
 
-    def test_add_sync_tables_single_probe_present(
-        self, tmp_path: Path, session: Session
-    ) -> None:
+    def test_add_sync_tables_single_probe_present(self, tmp_path: Path, session: Session) -> None:
         """A single imec0_imec_nidq.json in sync_dir shows up verbatim in scratch."""
         import json as _json
 
@@ -1612,9 +1641,7 @@ class TestAddSyncTables:
         assert set(blob["imec_nidq"].keys()) == {"imec0", "imec1"}
         assert blob["imec_nidq"]["imec1"]["b"] == pytest.approx(0.5)
 
-    def test_add_sync_tables_photodiode_from_events(
-        self, tmp_path: Path, session: Session
-    ) -> None:
+    def test_add_sync_tables_photodiode_from_events(self, tmp_path: Path, session: Session) -> None:
         """behavior_events with pd + ec columns produces a populated photodiode list."""
         import json as _json
 
@@ -1648,9 +1675,7 @@ class TestAddSyncTables:
         assert pd_rows[0]["trial_index"] == 0
         assert pd_rows[1]["trial_index"] == 1
 
-    def test_add_sync_tables_missing_files_marked(
-        self, tmp_path: Path, session: Session
-    ) -> None:
+    def test_add_sync_tables_missing_files_marked(self, tmp_path: Path, session: Session) -> None:
         """Empty sync_dir + None events → all three keys carry _missing sentinel."""
         import json as _json
 
@@ -1659,9 +1684,7 @@ class TestAddSyncTables:
 
         writer = _make_writer_with_nwbfile(session, tmp_path)
         # No exception — graceful fallback per the locked spec.
-        summary = writer.add_sync_tables(
-            writer._nwbfile, sync_dir, behavior_events=None
-        )
+        summary = writer.add_sync_tables(writer._nwbfile, sync_dir, behavior_events=None)
 
         assert summary["idempotent_skipped"] is False
         assert summary["n_probes"] == 0
@@ -1709,9 +1732,11 @@ class TestAppendRecordingStreamErrors:
         rec = _make_recording_without_gain(n_samples=3000, n_channels=4)
 
         writer = NWBWriter(session, nwb_path)
-        with patch("pynpxpipe.io.nwb_writer.SpikeGLXLoader.load_ap", return_value=rec):
-            with pytest.raises(ExportError):
-                writer.append_raw_data(session, nwb_path, time_range=(0.0, 0.1))
+        with (
+            patch("pynpxpipe.io.nwb_writer.SpikeGLXLoader.load_ap", return_value=rec),
+            pytest.raises(ExportError),
+        ):
+            writer.append_raw_data(session, nwb_path, time_range=(0.0, 0.1))
 
     def test_append_error_message_identifies_probe_and_stream(self, tmp_path, session):
         """Error message must embed probe_id ('imec0'), stream ('AP'), and 'gain_to_uV'."""
@@ -1723,9 +1748,11 @@ class TestAppendRecordingStreamErrors:
         rec = _make_recording_without_gain(n_samples=3000, n_channels=4)
 
         writer = NWBWriter(session, nwb_path)
-        with patch("pynpxpipe.io.nwb_writer.SpikeGLXLoader.load_ap", return_value=rec):
-            with pytest.raises(ExportError) as excinfo:
-                writer.append_raw_data(session, nwb_path, time_range=(0.0, 0.1))
+        with (
+            patch("pynpxpipe.io.nwb_writer.SpikeGLXLoader.load_ap", return_value=rec),
+            pytest.raises(ExportError) as excinfo,
+        ):
+            writer.append_raw_data(session, nwb_path, time_range=(0.0, 0.1))
 
         msg = str(excinfo.value)
         assert "imec0" in msg, msg
@@ -1891,3 +1918,58 @@ class TestMergedFromColumn:
         assert scratch_name in writer._nwbfile.scratch
         scratch_entry = writer._nwbfile.scratch[scratch_name]
         assert scratch_entry.data == raw_text
+
+
+# ===================================================================
+# K. Raw re-sort fidelity (nwb_writer.md §9) — inter_sample_shift,
+#    full geometry, .ap.meta archive
+# ===================================================================
+
+
+class TestRawResortFidelity:
+    """inter_sample_shift electrode column + full raw geometry + .ap.meta archive.
+
+    Closes the NWB-input re-sort gap: stored raw AP carries the per-channel ADC
+    sample shift so phase_shift can be reapplied on rerun (reader auto-restores
+    the column as a recording property via read_nwb_recording).
+    """
+
+    def test_add_probe_data_writes_inter_sample_shift_column(
+        self, writer: NWBWriter, probe: ProbeInfo
+    ) -> None:
+        writer.create_file()
+        shifts = np.linspace(0.0, 0.9, probe.n_channels)
+        writer.add_probe_data(probe, _make_mock_analyzer(n_units=2), inter_sample_shift=shifts)
+        electrodes = writer._nwbfile.electrodes
+        assert "inter_sample_shift" in electrodes.colnames
+        assert np.allclose(electrodes["inter_sample_shift"][:], shifts)
+
+    def test_add_probe_data_full_geometry_uses_raw_positions(
+        self, writer: NWBWriter, probe: ProbeInfo
+    ) -> None:
+        """Raw geometry (full physical channels) overrides the curated count."""
+        writer.create_file()
+        n_full = probe.n_channels + 1  # raw stream has one more channel than curated
+        raw_positions = [(float(i), float(i * 10)) for i in range(n_full)]
+        shifts = np.linspace(0.0, 0.9, n_full)
+        writer.add_probe_data(
+            probe,
+            _make_mock_analyzer(n_units=2),
+            raw_channel_positions=raw_positions,
+            inter_sample_shift=shifts,
+        )
+        assert len(writer._nwbfile.electrodes) == n_full
+
+    def test_append_raw_data_archives_ap_meta(self, session: Session, tmp_path: Path) -> None:
+        nwb_path = _create_nwb_with_electrodes(tmp_path, "imec0", n_channels=4)
+        rec, _ = _make_numpy_recording(n_samples=3000, n_channels=4)
+        writer = NWBWriter(session, nwb_path)
+        with patch("pynpxpipe.io.nwb_writer.SpikeGLXLoader.load_ap", return_value=rec):
+            writer.append_raw_data(session, nwb_path, time_range=(0.0, 0.1))
+
+        import pynwb
+
+        with pynwb.NWBHDF5IO(str(nwb_path), "r") as io:
+            nwbfile = io.read()
+            assert "ap_meta_imec0" in nwbfile.scratch
+            assert "fileCreateTime" in str(nwbfile.scratch["ap_meta_imec0"].data)

@@ -17,6 +17,7 @@ Design principles:
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import subprocess
@@ -271,6 +272,180 @@ class RecommendedParams:
     notes: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ResourceTuning:
+    """How aggressively auto-detection should use the machine.
+
+    Mirrors the tuning fields of ``core.config.ResourcesConfig`` 1:1, so users
+    can override each knob per machine in ``pipeline.yaml`` (zero hardcoding).
+    Defaults target ~90% of CPU + GPU utilization while keeping a hard RAM
+    safety margin: AP preprocessing is CPU/IO-bound (each worker holds only one
+    chunk), so cores and GPU ``batch_size`` — not RAM — are the throughput
+    levers. RAM is gated by ``ram_safety_factor * available - ram_reserve_gb``,
+    a proportional cap plus an absolute headroom that hedges the volatility of
+    ``psutil.available`` (which includes reclaimable cache) to avoid OOM.
+
+    Attributes:
+        reserve_cores: Physical cores left free for the OS/orchestrator.
+        n_jobs_cap: Hard ceiling on recommended n_jobs.
+        ram_safety_factor: Fraction of available RAM usable as the n_jobs budget.
+        ram_reserve_gb: Absolute RAM headroom always kept free.
+        chunk_ram_fraction: Fraction of available RAM used to size chunk_duration.
+        chunk_max_s: Largest chunk_duration (s) auto will pick.
+        max_workers_cap: Hard ceiling on recommended parallel-probe workers.
+        max_workers_ram_fraction: Fraction of available RAM for the worker budget.
+        vram_safety_factor: Fraction of (free VRAM - overhead) for KS4 batch_size.
+        vram_overhead_gb: VRAM reserved for driver/context before sizing batch_size.
+    """
+
+    reserve_cores: int = 1
+    n_jobs_cap: int = 64
+    ram_safety_factor: float = 0.85
+    ram_reserve_gb: float = 10.0
+    chunk_ram_fraction: float = 0.40
+    chunk_max_s: float = 5.0
+    max_workers_cap: int = 8
+    max_workers_ram_fraction: float = 0.85
+    vram_safety_factor: float = 0.90
+    vram_overhead_gb: float = 2.0
+
+
+@dataclass
+class MotionStrategy:
+    """DREDge memory-vs-precision decision for the motion-correction step.
+
+    The dominant memory of DREDge AP registration is the pairwise
+    cross-correlation matrices ``Ds``/``Cs`` of shape ``(B, T, T)`` (see
+    spikeinterface ``sortingcomponents/motion/dredge.py``), where ``B`` is the
+    number of nonrigid windows and ``T = duration_s / bin_s`` the number of time
+    bins. Memory therefore scales ~``B * (duration_s / bin_s) ** 2`` and is
+    almost independent of firing rate. This object reports whether DREDge fits
+    available RAM at the highest temporal precision (smallest ``bin_s``), or
+    whether to fall back to Kilosort4 internal ``nblocks`` drift correction.
+
+    Attributes:
+        use_dredge: True → run DREDge at ``bin_s``; False → fall back to nblocks.
+        bin_s: Resolved estimation bin (s) when ``use_dredge`` (may be fractional);
+            None on fallback.
+        n_windows: Number of nonrigid windows (B) used in the estimate.
+        n_time_bins: Number of time bins (T) at the resolved/cap bin_s.
+        predicted_peak_bytes: Predicted dominant memory at the resolved bin_s.
+        available_bytes: System RAM available at decision time.
+        budget_bytes: Memory budget for the matrices (available*safety - overhead).
+        fallback_nblocks: nblocks to use for sort when ``use_dredge`` is False.
+        reason: One-line human-readable decision reason (with numbers).
+        notes: Detailed reasoning lines for structured logging.
+    """
+
+    use_dredge: bool
+    bin_s: float | None
+    n_windows: int
+    n_time_bins: int
+    predicted_peak_bytes: int
+    available_bytes: int
+    budget_bytes: int
+    fallback_nblocks: int
+    reason: str
+    notes: list[str] = field(default_factory=list)
+
+
+def recommend_motion_strategy(
+    *,
+    duration_s: float,
+    n_windows: int,
+    available_bytes: int,
+    bin_s_floor: float = 1.0,
+    bin_s_max: float = 3.0,
+    bytes_per_entry: int = 4,
+    n_matrices: int = 4,
+    overhead_reserve_bytes: int = 16 * 1024**3,
+    ram_safety_factor: float = 0.6,
+    fallback_nblocks: int = 5,
+) -> MotionStrategy:
+    """Pick the highest-precision DREDge ``bin_s`` that fits RAM, else fall back.
+
+    Pure analytic decision — no SpikeInterface, no sampling. Solves
+    ``M(bin_s) = bytes_per_entry * n_matrices * n_windows * (duration_s/bin_s)**2``
+    for the smallest ``bin_s`` (best temporal resolution) with ``M <= budget``,
+    where ``budget = available_bytes * ram_safety_factor - overhead_reserve_bytes``.
+    Clamps to ``[bin_s_floor, bin_s_max]``; if the smallest fitting bin_s exceeds
+    ``bin_s_max`` (or the budget is non-positive), recommends the nblocks fallback.
+
+    Args:
+        duration_s: Recording duration in seconds (longest probe).
+        n_windows: Number of nonrigid windows B (from probe geometry).
+        available_bytes: Available system RAM in bytes.
+        bin_s_floor: Finest allowed bin_s (do not go below DREDge's native value).
+        bin_s_max: Coarsest acceptable bin_s; beyond it, fall back to nblocks.
+        bytes_per_entry: Bytes per matrix entry (float32 → 4).
+        n_matrices: Effective matrix multiplicity (Ds + Cs + float64 cast + solver).
+        overhead_reserve_bytes: Flat reserve for non-quadratic memory.
+        ram_safety_factor: Fraction of available RAM usable as the budget base.
+        fallback_nblocks: nblocks for sort when falling back.
+
+    Returns:
+        MotionStrategy with the decision and supporting numbers.
+    """
+    available = int(available_bytes)
+    budget = int(available * ram_safety_factor - overhead_reserve_bytes)
+    coef = bytes_per_entry * n_matrices * n_windows * (duration_s**2)
+    gb = 1024**3
+    notes = [
+        f"duration={duration_s:.0f}s n_windows={n_windows} available={available / gb:.1f}GB",
+        f"budget={budget / gb:.1f}GB "
+        f"(safety={ram_safety_factor}, overhead={overhead_reserve_bytes / gb:.1f}GB)",
+    ]
+
+    def _fallback(reason: str, n_time_bins: int, predicted: int) -> MotionStrategy:
+        return MotionStrategy(
+            use_dredge=False,
+            bin_s=None,
+            n_windows=n_windows,
+            n_time_bins=n_time_bins,
+            predicted_peak_bytes=predicted,
+            available_bytes=available,
+            budget_bytes=budget,
+            fallback_nblocks=fallback_nblocks,
+            reason=reason,
+            notes=notes + [reason],
+        )
+
+    if budget <= 0:
+        reason = (
+            f"budget {budget / gb:.1f}GB <= 0 (overhead exceeds usable RAM) "
+            f"→ fall back to nblocks={fallback_nblocks}"
+        )
+        return _fallback(reason, int(duration_s / bin_s_max) if bin_s_max else 0, 0)
+
+    bin_s_min = math.sqrt(coef / budget) if coef > 0 else bin_s_floor
+    if bin_s_min > bin_s_max:
+        reason = (
+            f"smallest fitting bin_s={bin_s_min:.3f}s exceeds bin_s_max={bin_s_max}s "
+            f"→ fall back to nblocks={fallback_nblocks}"
+        )
+        return _fallback(reason, int(duration_s / bin_s_max), int(coef / (bin_s_max**2)))
+
+    bin_s_opt = min(max(bin_s_min, bin_s_floor), bin_s_max)
+    predicted = int(coef / (bin_s_opt**2))
+    reason = (
+        f"DREDge fits at bin_s={bin_s_opt:.3f}s "
+        f"(smallest fitting {bin_s_min:.3f}s, predicted {predicted / gb:.1f}GB "
+        f"<= budget {budget / gb:.1f}GB)"
+    )
+    return MotionStrategy(
+        use_dredge=True,
+        bin_s=bin_s_opt,
+        n_windows=n_windows,
+        n_time_bins=int(duration_s / bin_s_opt),
+        predicted_peak_bytes=predicted,
+        available_bytes=available,
+        budget_bytes=budget,
+        fallback_nblocks=fallback_nblocks,
+        reason=reason,
+        notes=notes + [reason],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main detector
 # ---------------------------------------------------------------------------
@@ -360,31 +535,35 @@ class ResourceDetector:
         self,
         profile: HardwareProfile,
         probes: list[ProbeInfo] | None = None,
+        tuning: ResourceTuning | None = None,
     ) -> RecommendedParams:
         """Compute recommended parameter values from a HardwareProfile.
 
         Args:
             profile: HardwareProfile from detect().
             probes: List of ProbeInfo objects. If None, conservative defaults assumed.
+            tuning: Utilization knobs (reserve cores, RAM/VRAM safety factors,
+                caps). None → default ``ResourceTuning()``.
 
         Returns:
             RecommendedParams with computed values and human-readable notes.
         """
+        tuning = tuning or ResourceTuning()
         n_channels = probes[0].n_channels if probes else 384
         sample_rate = probes[0].sample_rate if probes else 30_000.0
         n_probes = len(probes) if probes else 1
 
         chunk_str, chunk_note = self._recommend_chunk_duration(
-            profile.ram, FALLBACK_N_JOBS, n_channels, sample_rate
+            profile.ram, FALLBACK_N_JOBS, n_channels, sample_rate, tuning
         )
         chunk_s = float(chunk_str[:-1])
 
         n_jobs, jobs_note = self._recommend_n_jobs(
-            profile.cpu, profile.ram, chunk_s, n_channels, sample_rate
+            profile.cpu, profile.ram, chunk_s, n_channels, sample_rate, tuning
         )
 
-        max_workers, workers_note = self._recommend_max_workers(profile.ram, n_probes)
-        batch_size, batch_note = self._recommend_batch_size(profile.primary_gpu)
+        max_workers, workers_note = self._recommend_max_workers(profile.ram, n_probes, tuning)
+        batch_size, batch_note = self._recommend_batch_size(profile.primary_gpu, tuning)
 
         return RecommendedParams(
             n_jobs=n_jobs,
@@ -606,17 +785,25 @@ class ResourceDetector:
         chunk_duration_s: float,
         n_channels: int,
         sample_rate: float,
+        tuning: ResourceTuning | None = None,
     ) -> tuple[int, str]:
         """Compute recommended n_jobs from CPU and RAM constraints."""
+        tuning = tuning or ResourceTuning()
         physical = cpu.physical_cores or max(1, (os.cpu_count() or 2) // 2)
-        n_jobs_cpu = max(1, physical - 2)
+        n_jobs_cpu = max(1, physical - tuning.reserve_cores)
 
         bytes_per_sec = n_channels * sample_rate * 4 * 5
         memory_per_job = bytes_per_sec * chunk_duration_s
         available_bytes = ram.available_gb * 1e9
-        n_jobs_mem = max(1, int(available_bytes * 0.60 / memory_per_job))
+        # Double gate: proportional budget minus an absolute headroom. The
+        # absolute reserve hedges psutil.available volatility (reclaimable cache)
+        # so we never claim the whole box and OOM.
+        usable_ram = max(
+            0.0, available_bytes * tuning.ram_safety_factor - tuning.ram_reserve_gb * 1e9
+        )
+        n_jobs_mem = max(1, int(usable_ram / memory_per_job))
 
-        n_jobs = min(n_jobs_cpu, n_jobs_mem, 16)
+        n_jobs = min(n_jobs_cpu, n_jobs_mem, tuning.n_jobs_cap)
 
         if n_jobs_cpu <= n_jobs_mem:
             note = f"n_jobs: CPU-bound ({physical} physical cores → {n_jobs})"
@@ -631,14 +818,16 @@ class ResourceDetector:
         n_jobs_estimate: int,
         n_channels: int,
         sample_rate: float,
+        tuning: ResourceTuning | None = None,
     ) -> tuple[str, str]:
         """Compute recommended chunk_duration from available RAM."""
+        tuning = tuning or ResourceTuning()
         bytes_per_sec = n_channels * sample_rate * 4 * 5
         available_bytes = ram.available_gb * 1e9
-        memory_budget = available_bytes * 0.40
+        memory_budget = available_bytes * tuning.chunk_ram_fraction
         bytes_per_chunk = memory_budget / max(1, n_jobs_estimate)
         chunk_raw_s = bytes_per_chunk / bytes_per_sec
-        chunk_raw_s = max(0.5, min(5.0, chunk_raw_s))
+        chunk_raw_s = max(0.5, min(tuning.chunk_max_s, chunk_raw_s))
 
         if chunk_raw_s >= 4.0:
             chunk_str = "5s"
@@ -656,19 +845,32 @@ class ResourceDetector:
         self,
         ram: RAMInfo,
         n_probes: int,
+        tuning: ResourceTuning | None = None,
     ) -> tuple[int, str]:
         """Compute recommended max_workers for parallel probe processing."""
-        max_by_memory = max(1, int(ram.available_gb * 0.70 / _PER_PROBE_PEAK_GB))
-        max_workers = min(max_by_memory, n_probes, 4)
+        tuning = tuning or ResourceTuning()
+        max_by_memory = max(
+            1, int(ram.available_gb * tuning.max_workers_ram_fraction / _PER_PROBE_PEAK_GB)
+        )
+        max_workers = min(max_by_memory, n_probes, tuning.max_workers_cap)
         note = f"max_workers: {max_workers} (RAM: {ram.available_gb:.1f} GB, probes: {n_probes})"
         return max_workers, note
 
-    def _recommend_batch_size(self, gpu: GPUInfo | None) -> tuple[int, str]:
+    def _recommend_batch_size(
+        self,
+        gpu: GPUInfo | None,
+        tuning: ResourceTuning | None = None,
+    ) -> tuple[int, str]:
         """Compute recommended Kilosort4 batch_size from available VRAM."""
+        tuning = tuning or ResourceTuning()
         if gpu is None:
             return FALLBACK_BATCH_SIZE, "batch_size: no GPU detected, using default (CPU mode)"
 
-        vram_for_batch = max(0.0, gpu.vram_free_gb - _VRAM_OVERHEAD_GB) * (1024**3) * 0.80
+        vram_for_batch = (
+            max(0.0, gpu.vram_free_gb - tuning.vram_overhead_gb)
+            * (1024**3)
+            * tuning.vram_safety_factor
+        )
         batch_raw = int(vram_for_batch / _BYTES_PER_SAMPLE_VRAM)
 
         if batch_raw >= 60_000:
@@ -780,7 +982,7 @@ class ResourceConfig:
         gpu = self._profile.primary_gpu
         batch = sorting_config.sorter.params.batch_size
         if isinstance(batch, int) and gpu is not None:
-            vram_safe = max(0.0, gpu.vram_free_gb - _VRAM_OVERHEAD_GB) * (1024**3) * 0.80
+            vram_safe = max(0.0, gpu.vram_free_gb - _VRAM_OVERHEAD_GB) * (1024**3) * 0.90
             safe_max = int(vram_safe / _BYTES_PER_SAMPLE_VRAM)
             if batch > safe_max and safe_max > 0:
                 warnings.append(
